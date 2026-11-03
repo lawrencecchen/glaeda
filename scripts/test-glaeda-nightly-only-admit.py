@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,6 +139,117 @@ class RefusalTest(unittest.TestCase):
                                  env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=60, check=False)
             self.assertEqual(got.returncode, 1)
             self.assertIn("cannot load the runner hook", got.stdout)
+
+
+MINE = "41655282358"
+NN_WORKFLOW_REF = f"{REPO}/.github/workflows/nightly.yml@refs/heads/nightly-next"
+
+
+def appcast(*versions: int) -> str:
+    items = "".join(f"<item><sparkle:version>{v}</sparkle:version></item>" for v in versions)
+    return f'<?xml version="1.0"?><rss><channel>{items}</channel></rss>'
+
+
+class NewestRunFirstTest(unittest.TestCase):
+    """An older nightly-next run's jobs yield (are refused in seconds) only when the feed already has a newer build."""
+
+    def why(self, job_name: str, highest=None, run_id: str = MINE, attempt: str = "1"):
+        return admit.yield_refusal(job_name, run_id, attempt, highest)
+
+    def test_scope_is_attempt_one_of_a_nightly_next_push_and_a_pre_publish_job(self):
+        wf = NN_WORKFLOW_REF
+        self.assertTrue(admit.yield_scope("push", "refs/heads/nightly-next", REPO, wf, "build-nightly-app", "1"))
+        self.assertFalse(admit.yield_scope("push", "refs/heads/nightly-next", REPO, wf, "build-nightly-app", "2"))
+        self.assertFalse(admit.yield_scope("workflow_dispatch", "refs/heads/nightly-next", REPO, wf,
+                                           "build-nightly-app", "1"))
+        self.assertFalse(admit.yield_scope("push", "refs/heads/main", REPO,
+                                           f"{REPO}/.github/workflows/nightly.yml@refs/heads/main",
+                                           "build-nightly-app", "1"))
+        for name in ("decide", "legacy-signer-dmg-image", "verify-nightly-identity-legacy-pool",
+                     "nightly-identity-legacy-published", "report-nightly-failure", "close-nightly-failure-issue",
+                     "publish-nightly", "generate-nightly-deltas"):
+            with self.subTest(job=name):
+                self.assertFalse(admit.yield_scope("push", "refs/heads/nightly-next", REPO, wf, name, "1"))
+
+    def test_an_overtaken_run_yields_every_pre_publish_job(self):
+        build = int(MINE) * 100 + 1
+        for name in sorted(admit.BEFORE_PUBLISH_JOBS):
+            with self.subTest(job=name):
+                why = self.why(name, highest=build + 100)
+                self.assertIsNotNone(why)
+                self.assertIn("can never publish", why)
+        self.assertIsNone(self.why("signer-dmg-image", highest=build))  # its own published build is not newer
+        self.assertIsNone(self.why("signer-dmg-image", highest=build - 100))
+        self.assertIsNone(self.why("signer-dmg-image", highest=None))  # an unreadable feed admits
+        self.assertIsNone(self.why("legacy-signer-dmg-image", highest=build + 100))  # post-publication: never
+
+    def test_a_newer_attempt_of_the_same_run_counts_but_this_runs_own_attempt_does_not(self):
+        build = int(MINE) * 100 + 1
+        self.assertIsNotNone(self.why("build-nightly-app", highest=build + 1))  # attempt 2 of this run published
+        self.assertIsNone(self.why("build-nightly-app", highest=build, attempt="1"))
+
+    def test_a_newer_push_alone_never_makes_a_run_yield(self):
+        # cmux #28961: skipping for any newer push let promotions outrun every build. With nothing published above it,
+        # the run keeps every slot, whatever newer runs exist or are building.
+        self.assertIsNone(self.why("build-nightly-app", highest=int(MINE) * 100 - 500))
+        self.assertIsNone(self.why("build-nightly-app", highest=None))
+
+    def test_ids_that_are_not_numbers_admit(self):
+        self.assertIsNone(self.why("build-nightly-app", highest=10 ** 17, run_id="abc"))
+        self.assertIsNone(self.why("build-nightly-app", highest=10 ** 17, run_id=""))
+        self.assertIsNone(self.why("build-nightly-app", highest=10 ** 17, attempt="x"))
+
+    def test_feed_parsing(self):
+        self.assertEqual(admit.feed_highest(appcast(4165528235801, 4165709173201, 4165000000001)), 4165709173201)
+        self.assertIsNone(admit.feed_highest("<rss></rss>"))
+
+    def test_newest_first_refusal_never_raises(self):
+        env = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/nightly-next", "GITHUB_REPOSITORY": REPO,
+               "GITHUB_WORKFLOW_REF": NN_WORKFLOW_REF, "GITHUB_JOB": "build-nightly-app", "GITHUB_RUN_ATTEMPT": "1",
+               "GITHUB_RUN_ID": MINE}
+        with mock.patch.object(admit, "read_feed_highest", side_effect=RuntimeError("boom")):
+            self.assertIsNone(admit.newest_first_refusal(hook, env))
+
+    def cli(self, tmp: str, feed: Path, job_name: str, run_id: str, ref: str = "refs/heads/nightly-next",
+            extra: list[str] | None = None):
+        event = Path(tmp) / "event.json"
+        event.write_text(json.dumps({"ref": ref, "repository": {"full_name": REPO}}))
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp, "GITHUB_EVENT_PATH": os.fspath(event),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_REF": ref, "GITHUB_REPOSITORY": REPO,
+               "GITHUB_WORKFLOW_REF": f"{REPO}/.github/workflows/nightly.yml@{ref}", "GITHUB_JOB": job_name,
+               "GITHUB_RUN_ID": run_id, "GITHUB_RUN_ATTEMPT": "1", admit.FEED_URL_ENV: feed.as_uri()}
+        return subprocess.run([sys.executable, os.fspath(ADMIT), "--hook", os.fspath(HOOK), *(extra or [])], env=env,
+                              capture_output=True, text=True, timeout=60, check=False)
+
+    def test_cli_yields_an_overtaken_job_and_admits_the_newest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            feed = Path(tmp) / "appcast-arm64.xml"
+            newer = str(int(MINE) + 1000)
+            feed.write_text(appcast(int(newer) * 100 + 1))
+            got = self.cli(tmp, feed, "verify-final-dmg-nightly", MINE)
+            self.assertEqual(got.returncode, 1, got.stdout + got.stderr)
+            self.assertIn("yielded to a newer run", got.stdout)
+            got = self.cli(tmp, feed, "verify-final-dmg-nightly", newer)  # its own build is the feed's highest
+            self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+            got = self.cli(tmp, feed, "build-nightly-app", str(int(newer) + 1))
+            self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+            feed.unlink()  # an unreadable feed admits
+            got = self.cli(tmp, feed, "build-nightly-app", MINE)
+            self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+
+    def test_the_trusted_path_on_main_never_yields(self):
+        # --trusted-ref serves main's nightly: out of scope (nightly-next only), so a high feed changes nothing there
+        with tempfile.TemporaryDirectory() as tmp:
+            feed = Path(tmp) / "appcast-arm64.xml"
+            feed.write_text(appcast(10 ** 17))
+            with mock.patch.object(admit, "read_feed_highest", side_effect=AssertionError("feed read out of scope")):
+                env = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": REPO,
+                       "GITHUB_WORKFLOW_REF": f"{REPO}/.github/workflows/nightly.yml@refs/heads/main",
+                       "GITHUB_JOB": "build-nightly-app", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_RUN_ID": MINE}
+                self.assertIsNone(admit.newest_first_refusal(hook, env))
+            got = self.cli(tmp, feed, "build-nightly-app", MINE, ref="refs/heads/main",
+                           extra=["--trusted-ref", "refs/heads/main", "--trusted-repo", REPO])
+            self.assertNotIn("yielded to a newer run", got.stdout + got.stderr)
 
 
 def manifest(runner: dict) -> dict:

@@ -33,6 +33,10 @@ job CI_SEED_TRUSTED_POOL names, which warms the trusted nightly app build). Ever
 refused, so a host dedicated to the nightly runs no side work here. It still refuses a signing job, for the same
 reason as above.
 
+On attempt 1 of a nightly-next push it also lets an overtaken run yield to a newer one (newest run first,
+newest_first_refusal): a pre-publish job of a run whose build is already below the cmux NEXT feed's highest is refused
+in seconds, so the runner takes the next queued job instead. See the block above newest_first_refusal.
+
 It reuses the hook's own pieces (job_tier, dev_compile_refusal, job_class, load_event) by loading the hook file the
 runner actually runs, so the two never disagree on what a nightly job is, and the hook's bytes (pinned by the
 signing-hook trust list) do not change.
@@ -43,6 +47,8 @@ import argparse
 import importlib.machinery
 import importlib.util
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -102,6 +108,93 @@ def trusted_refusal(hook: Any, event_name: str | None, ref: str | None, reposito
     return None
 
 
+# Newest run first (claude-sr2-coord, 2026-11-03). nightly-next is promoted about every 6 minutes and a run takes 40-55,
+# so 5-6 runs share these minis' slots at once, and GitHub hands an idle runner the oldest queued job: run 41655282358
+# (#15807) took 39 min from landing to the feed, about 6 of them queued behind older runs. The runners cannot pick a
+# job, so the admission refuses, in seconds, the jobs of an older run that is certain not to publish, and the slot goes
+# to the next queued job. Only attempt 1 of a nightly-next push of the nightly is ever refused this way (a re-run is
+# someone's deliberate choice), and only when it is overtaken: the cmux NEXT feed already lists a build above this
+# run's (CFBundleVersion is the run id then the attempt in two digits, nightly_version.py). Publication is
+# latest-wins, so this run can never publish, and cmux's own sign-pick-overtaken.sh already skips its signing for the
+# same reason. Every job up to publish-nightly that takes these runners (BEFORE_PUBLISH_JOBS) yields; post-publication
+# jobs (legacy identity, deltas, reports) never do.
+#
+# A newer push, or a newer build merely running, never makes a run yield: that newer build may still fail, and when
+# every run skipped for a newer push, promotions outran the pre-build phase and nothing built (cmux #28961). Started
+# jobs are never touched; the admission sees only a job about to start. The read is bounded and any doubt (feed
+# unreadable, an id that is not a number) admits as before.
+NIGHTLY_NEXT_FEED_URL = "https://files-next.cmux.com/nightly-next/next/appcast-arm64.xml"
+FEED_URL_ENV = "GLAEDA_NIGHTLY_NEXT_FEED_URL"  # tests point it at a file:// feed
+FEED_FETCH_S = 8
+FEED_MAX_BYTES = 4 << 20
+BEFORE_PUBLISH_JOBS = frozenset({
+    "resolve-nightly-cmux-tui-client", "pick-nightly-build-runner", "build-nightly-app", "find-nightly-next-recovery",
+    "resolve-nightly-ghostty-cli-helper", "build-nightly-ghostty-cli-helper", "build-nightly-inputs",
+    "check-nightly-webviews", "await-nightly-tree-marker", "prepare-nightly-variant-primary", "prepare-nightly-variant",
+    "signer-dmg-image", "verify-signed-nightly", "verify-final-dmg-nightly", "launch-smoke-nightly"})
+YIELD_REPOSITORY = "manaflow-ai/cmux"
+NIGHTLY_NEXT_REF = "refs/heads/nightly-next"
+SPARKLE_VERSION = re.compile(r"<sparkle:version>\s*([0-9]{1,18})\s*</sparkle:version>")
+
+
+def run_build(run_id: str | None, attempt: str | None) -> int | None:
+    """This run's CFBundleVersion (run id, then the attempt in two digits), or None when either is not a number."""
+    if not run_id or not attempt or not run_id.isdigit() or not attempt.isdigit() or len(run_id) > 16:
+        return None
+    return int(run_id) * 100 + int(attempt)
+
+
+def yield_scope(event_name: str | None, ref: str | None, repository: str | None, workflow_ref: str | None,
+                job: str | None, run_attempt: str | None) -> bool:
+    """Whether this job may yield to a newer run: attempt 1 of a nightly-next push of the nightly, a pre-publish job."""
+    return (event_name == "push" and ref == NIGHTLY_NEXT_REF and repository == YIELD_REPOSITORY
+            and workflow_ref == f"{YIELD_REPOSITORY}/.github/workflows/nightly.yml@{NIGHTLY_NEXT_REF}"
+            and run_attempt == "1" and job in BEFORE_PUBLISH_JOBS)
+
+
+def feed_highest(text: str) -> int | None:
+    """The highest sparkle:version an appcast lists, or None."""
+    versions = [int(found) for found in SPARKLE_VERSION.findall(text)]
+    return max(versions) if versions else None
+
+
+def yield_refusal(job: str | None, run_id: str | None, run_attempt: str | None, highest: int | None) -> str | None:
+    """Why this in-scope job yields to a newer run (the feed already has a newer build), or None. Pure."""
+    build = run_build(run_id, run_attempt)
+    if build is None or job not in BEFORE_PUBLISH_JOBS or highest is None or highest <= build:
+        return None
+    return (f"yielded to a newer run: the cmux NEXT feed already has build {highest}, above this run's {build}, so this "
+            "run can never publish (latest-wins); its slot goes to a newer run's job")
+
+
+def read_feed_highest(hook: Any) -> int | None:
+    """The cmux NEXT feed's highest build (curl, bounded), or None when it cannot be read."""
+    url = os.environ.get(FEED_URL_ENV) or NIGHTLY_NEXT_FEED_URL
+    protocols = "=https,file" if os.environ.get(FEED_URL_ENV) else "=https"
+    try:
+        fetched = subprocess.run([getattr(hook, "CURL", "curl"), "-fsSL", "--proto", protocols, "--max-time",
+                                  str(FEED_FETCH_S), "--max-filesize", str(FEED_MAX_BYTES), "-A",
+                                  "glaeda-nightly-only-admit/1", url],
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                                 timeout=FEED_FETCH_S + 5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return feed_highest(fetched.stdout) if fetched.returncode == 0 else None
+
+
+def newest_first_refusal(hook: Any, env: Any) -> str | None:
+    """yield_refusal for the job in env, reading the feed only when the job is in scope. Never raises: any failure
+    admits."""
+    try:
+        if not yield_scope(env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"),
+                           env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"), env.get("GITHUB_RUN_ATTEMPT")):
+            return None
+        return yield_refusal(env.get("GITHUB_JOB"), env.get("GITHUB_RUN_ID"), env.get("GITHUB_RUN_ATTEMPT"),
+                             read_feed_highest(hook))
+    except Exception:  # noqa: BLE001  (an ordering hint must never refuse a job by failing)
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX, description="admit only NEXT nightly work (exit 0), else refuse (1)")
     p.add_argument("--hook", type=Path, required=True, help="the runner's glaeda-cmux-runner-hook")
@@ -125,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         why = refusal(hook, env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"), event,
                       env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"))
+    if not why:
+        why = newest_first_refusal(hook, env)
     if why:
         print(f"{PREFIX}: refused: {why}", flush=True)
         print(f"::error::{PREFIX}: refused: {why}", flush=True)

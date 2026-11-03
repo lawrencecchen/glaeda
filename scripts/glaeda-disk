@@ -3933,12 +3933,17 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # were refused at its 30 GiB floor and every pressure pass reached nothing. A VM made from an image is its own
         # copy under ~/.tart/vms, so the cached image goes once idle DEFAULT_AGE_HOURS (a live tart process or open
         # file still keeps it) and the next `tart clone` pulls it again.
-        Family("tart-images", HOME / ".tart/cache/OCIs", True, "the next tart clone or pull downloads it again",
-               depth=3, owner="Tart (tart pull)", rebuild_minutes=20, min_idle_hours=DEFAULT_AGE_HOURS,
-               platform="macos"),
-        Family("tart-ipsws", HOME / ".tart/cache/IPSWs", True, "the next tart create downloads it again",
+        # An item is one image repository (tart_image_dirs: the directory that holds the sha256:<digest> manifests
+        # and the tag links to them, at any depth, so a nested ghcr path is never cut above or below its image), and
+        # its last use is Tart's own access date on its digest directories (tart_last_use): `tart clone` leaves every
+        # mtime alone, so an image cloned daily would read as idle by mtime and be pulled again, tens of GiB each time.
+        # Where Tart is installed the window is TART_IDLE_HOURS (a week; APFS moves atime lazily), where it is not
+        # DEFAULT_AGE_HOURS (tart_idle_hours). A root that is a symlink or resolves outside HOME is never walked.
+        Family(TART_IMAGES, HOME / ".tart/cache/OCIs", True, "the next tart clone or pull downloads it again",
+               owner="Tart (tart pull)", rebuild_minutes=20, min_idle_hours=tart_idle_hours(), platform="macos"),
+        Family(TART_IPSWS, HOME / ".tart/cache/IPSWs", True, "the next tart create downloads it again",
                files=True, owner="Tart (tart create --from-ipsw)", rebuild_minutes=20,
-               min_idle_hours=DEFAULT_AGE_HOURS, platform="macos"),
+               min_idle_hours=tart_idle_hours(), platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -4538,14 +4543,16 @@ def item_mtime(fam: Family, path: Path) -> float:
     # reuse window. Active jobs are still protected by process evidence and the
     # git-loss check before deletion.
     skip_names = frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE) else frozenset()
-    newest = newest_mtime(path, 2 if fam.reclaimable else 1, 3000 if fam.reclaimable else 300,
-                          access=fam.discover, skip_names=skip_names)
+    # Tart's access date first, and a walk that never lists a digest directory, which would move that date
+    tart = tart_last_use(path) if fam.id in TART_FAMILIES else 0.0
+    newest = newest_mtime(path, 1 if fam.id in TART_FAMILIES else 2 if fam.reclaimable else 1,
+                          3000 if fam.reclaimable else 300, access=fam.discover, skip_names=skip_names)
     if fam.id == SPM_SCRATCH:
         with contextlib.suppress(OSError):
             newest = max(newest, spm_lock(path).stat().st_mtime)
     if fam.id == NIGHTLY_NEXT_FAMILY:
         newest = max(newest, nightly_next_last_use(path))
-    return newest
+    return max(newest, tart)
 
 
 # Files every nightly-next build on a runner rewrites, below its tree (cmux nightly_build_state.py's layout), each
@@ -5121,7 +5128,10 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
             dirs.update(cmux_next_ci_state_parents(fam.root))
             dirs.update(cmux_next_ci_host_parents(fam.root))
-        if fam.discover or fam.checkout_builds:
+        if fam.id == TART_IMAGES:  # an image sits at any depth: every namespace directory above one
+            if tart_root_safe(fam.root):
+                dirs.update(tart_walk(fam.root)[1])
+        elif fam.discover or fam.checkout_builds:
             dirs.update(p.parent for p in candidates(fam))
         else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
             level = [fam.root]
@@ -7236,8 +7246,135 @@ def _search(fam: Family, budget: int = 20000) -> list[Path]:
 _DISCOVERED: dict[str, list[Path]] = {}
 
 
+TART_IMAGES, TART_IPSWS = "tart-images", "tart-ipsws"
+TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS})
+TART_IDLE_HOURS = 7 * 24.0  # a week past Tart's last access; APFS updates atime lazily
+TART_DIGEST_PREFIX = "sha256:"
+TART_SEARCH_DEPTH = 8  # registry/namespace.../image below OCIs; a deeper tree is not Tart's
+TART_BINARIES = ("/opt/homebrew/bin/tart", "/usr/local/bin/tart")
+
+
+def tart_root_safe(root: Path) -> bool:
+    """Whether a Tart cache root may be walked: it and every directory from HOME down to it are real directories
+    (no symlink anywhere on the way) and it resolves inside HOME. A ~/.tart linked to a shared or external store is
+    someone else's, and following it could delete what this host does not own."""
+    try:
+        home = Path(os.path.realpath(HOME))
+        rel = Path(os.path.abspath(root)).relative_to(os.path.abspath(HOME))
+    except ValueError:
+        return False
+    walk = Path(os.path.abspath(HOME))
+    for part in rel.parts:
+        walk = walk / part
+        if walk.is_symlink():
+            return False
+    real = Path(os.path.realpath(root))
+    return real != home and home in real.parents and real.is_dir()
+
+
+def tart_walk(root: Path) -> tuple[list[Path], list[Path]]:
+    """(image repositories, the namespace directories above them) under Tart's OCI cache. An image repository is a
+    directory with a sha256:<digest> child (a pulled manifest; its tag links point at those), found at any depth up to
+    TART_SEARCH_DEPTH and never descended into, never through a symlink and never inside an aside tree. Deleting the
+    repository as one item removes its tags with their digests, so no tag is left dangling, and a nested registry path
+    (ghcr.io/org/team/image) is one item at the image, not at a namespace above it. The namespace directories are
+    where remove() leaves an aside image, so interrupted_families looks there."""
+    found: list[Path] = []
+    spaces: list[Path] = [root]
+    level = [root]
+    for _ in range(TART_SEARCH_DEPTH):
+        nxt: list[Path] = []
+        for d in level:
+            subdirs = [Path(e.path) for e in _entries(d) if e.is_dir(follow_symlinks=False)]
+            if d != root and any(p.name.startswith(TART_DIGEST_PREFIX) for p in subdirs):
+                found.append(d)
+                continue
+            if d != root:
+                spaces.append(d)
+            nxt.extend(p for p in subdirs if not DELETING_RE.fullmatch(p.name))
+        level = nxt
+    return found, spaces
+
+
+def tart_image_dirs(root: Path) -> list[Path]:
+    """The image repositories under Tart's OCI cache (tart_walk)."""
+    return tart_walk(root)[0]
+
+
+def tart_last_use(path: Path) -> float:
+    """Tart's last use of a cached image repository: the newest mtime or atime of the repository and of each
+    sha256:<digest> directory in it, read with lstat only. Tart records its access date on the digest directory
+    (contentAccessDate) when it clones or runs from the cache, and `tart clone` changes no mtime. The digest
+    directories are never listed here, which would move the very atime being read. An IPSW is a file: its own times."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return 0.0
+    if not stat.S_ISDIR(st.st_mode):
+        return max(st.st_mtime, st.st_atime)
+    newest, access = st.st_mtime, tart_installed()
+    for e in _entries(path):
+        if e.name.startswith(TART_DIGEST_PREFIX):
+            with contextlib.suppress(OSError):
+                est = e.stat(follow_symlinks=False)
+                # Without Tart nothing on the host reads the cache but glaeda-disk's own walks (the survey's du), which
+                # move atime themselves: only mtime counts then.
+                newest = max(newest, est.st_mtime, tart_access(Path(e.path), est) if access else 0.0)
+    return newest
+
+
+# TART_ACCESS: the digest directories' access dates as this run first saw them, before any walk of its own (the
+# survey's du lists every digest directory and so moves its atime). tart_last_use judges by the first reading, and
+# the run's end hands the date back to each directory its walks moved (tart_restore_access), so the next run sees
+# Tart's own date and not glaeda-disk's: otherwise every pass would make every image look used. A Tart access during this very
+# run (after RUN_STARTED) that a later walk moved again is the one date this can hand back wrongly; the live process
+# and open-file checks still keep an image Tart is using, and a wrongly reclaimed image is pulled again.
+TART_ACCESS: dict[str, float] = {}
+TART_RUN_STARTED = time.time()
+
+
+def tart_access(digest: Path, st: os.stat_result) -> float:
+    """The digest directory's access date as Tart left it (TART_ACCESS). Never raises."""
+    if not TART_ACCESS:
+        atexit.register(tart_restore_access)
+    return TART_ACCESS.setdefault(os.fspath(digest), st.st_atime)
+
+
+def tart_restore_access() -> None:
+    """At the end of the run, hand each digest directory the access date Tart left it, where only this run's walks
+    (the survey's du, the verdicts' checks) moved it since (TART_ACCESS). Never raises."""
+    for key, first in list(TART_ACCESS.items()):
+        with contextlib.suppress(OSError):
+            st = os.lstat(key)
+            if st.st_atime > first and st.st_atime >= TART_RUN_STARTED:
+                os.utime(key, (first, st.st_mtime), follow_symlinks=False)
+
+
+def tart_seen(fam: Family, items: list[Path]) -> None:
+    """Read each image's access dates before anything of this run walks it (TART_ACCESS)."""
+    if fam.id == TART_IMAGES:
+        for item in items:
+            tart_last_use(item)
+
+
+def tart_installed() -> bool:
+    """Whether this host can run Tart (on PATH or in Homebrew's prefixes). Without it nothing reads the cache."""
+    return bool(shutil.which("tart")) or any(os.access(p, os.X_OK) for p in TART_BINARIES)
+
+
+def tart_idle_hours() -> float:
+    """The idle window of Tart's cache: TART_IDLE_HOURS where Tart is installed (a weekly clone keeps its image even
+    when APFS moved the access date late), DEFAULT_AGE_HOURS where it is not, since nothing on the host reads it."""
+    return TART_IDLE_HOURS if tart_installed() else DEFAULT_AGE_HOURS
+
+
 def candidates(fam: Family) -> list[Path]:
-    if fam.transcripts or fam.transcript_archives:
+    if fam.id in TART_FAMILIES and not tart_root_safe(fam.root):
+        return []
+    if fam.id == TART_IMAGES:
+        level = tart_image_dirs(fam.root)
+        tart_seen(fam, level)
+    elif fam.transcripts or fam.transcript_archives:
         level = transcript_candidates(fam.root, fam.transcript_archives)
     elif fam.discover:
         key = os.fspath(fam.root)

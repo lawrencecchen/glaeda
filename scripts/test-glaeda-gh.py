@@ -1939,6 +1939,27 @@ class BalanceTest(Base):
         self.assertNotIn("checksPageError", data)
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
+    def test_status_pr_check_pages_stop_at_their_hourly_share(self) -> None:
+        """Past PR_PAGES_POINTS_PER_HOUR the follow-up pages stop, and the PR reads pending, never green."""
+        checks = [workflow_check(f"job-{i}", 5) for i in range(150)]
+        first = pr_node(11, checks=checks[:100])
+        contexts = first["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+        contexts["totalCount"] = len(checks)
+        contexts["pageInfo"] = {"hasNextPage": True, "endCursor": "100"}
+        first["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": ["job-149"]}, "rules": {"nodes": []}}
+        self.gh.prs[("o", "r", 11)] = first
+        self.gh.heads[("o", "r", "a" * 40)] = checks
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        self.daemon.gql_log = [(NOW - 60, "pr-pages", gg.PR_PAGES_POINTS_PER_HOUR)]
+        gg.register("pr:o/r#11")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#11")["data"]
+        self.assertEqual(len(data["checks"]), 100)
+        self.assertEqual(data["checksPageError"], "graphql: PR check pages over their hourly share")
+        self.assertIsNone(gg.verdict("pr", data))  # a required check past the first page is unread: pending
+        self.assertIsNone(gg.verdict("pr", data, until="required"))
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+
     def test_steps_come_from_rest_so_a_refused_check_is_still_held(self) -> None:
         """PRs move to REST when GraphQL is stopped; the failed steps must not need GraphQL."""
         now = time.time()

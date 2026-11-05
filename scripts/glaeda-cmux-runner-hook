@@ -362,10 +362,30 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # then is refused so its re-run takes Blacksmith. Admitted, it tells the job through $GITHUB_ENV
 # (GLAEDA_JOB_CLAIM=exclusive); cmux's signing jobs refuse to touch the key on an owned Mac without it, so a hook
 # from before this class never signs beside a PR job.
+# ONE_MINI_NIGHTLY (Lawrence, 2026-11-05: every classic and nightly-next nightly job on one Mac mini, cmux15, with no
+# Blacksmith): nightly-next's short jobs that hold a release key (cmux tests/test_nightly_owned_minis_only.py
+# PENDING_GLAEDA, from promote-nightly-next-acked to legacy-identity-target below) ran on GitHub-hosted ubuntu because
+# the trusted signing runner admitted only SIGNING_JOBS. They are SIGNING_JOBS now: the exclusive class, so each one
+# drains the Mac once, like the other signing jobs.
 SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-sign-notarize-nightly"),
                 ("nightly.yml", "recover-nightly-next-notarization"), ("nightly.yml", "publish-nightly"),
                 ("nightly.yml", "publish-nightly-next-github"), ("nightly.yml", "publish-nightly-next-github-names"),
                 ("nightly.yml", "sign-nightly-identity-legacy"), ("nightly.yml", "generate-nightly-deltas"),
+                ("nightly.yml", "promote-nightly-next-acked"), ("nightly.yml", "keep-published-dsyms"),
+                ("nightly.yml", "sentry-dsyms-nightly"), ("nightly.yml", "sign-release-notes"),
+                ("nightly.yml", "publish-release-notes"), ("nightly.yml", "publish-nightly-reel"),
+                ("nightly.yml", "publish-nightly-identity-legacy"), ("nightly.yml", "republish-nightly-deltas"),
+                ("nightly.yml", "legacy-identity-target"),
+                # AUTO_RESUME (below trusted_refusal): the classic continuation's key-holding jobs that do
+                # work. Its three jobs that only wait on Apple's notary queue are not here: they are light
+                # (AUTO_RESUME_POLL_JOBS), because an exclusive class has no bound on how long a job runs and
+                # theirs is Apple's queue, not ours.
+                ("auto-resume-nightly-notarization.yml", "wait-and-staple"),
+                ("auto-resume-nightly-notarization.yml", "staple-outer"),
+                ("auto-resume-nightly-notarization.yml", "staple-stapled"),
+                ("auto-resume-nightly-notarization.yml", "publish"),
+                ("auto-resume-nightly-notarization.yml", "generate-deltas"),
+                ("auto-resume-nightly-notarization.yml", "republish-deltas"),
                 ("release.yml", "build-sign-notarize"),
                 ("repair-v0-64-25-helper-rpaths.yml", "repair"), ("cmux-next-dev-daily.yml", "sign"))
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
@@ -428,6 +448,19 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly-next-canary.yml", "canary"): "isolated",
                         ("nightly-next-launch-smoke.yml", "smoke"): "isolated",
                         ("nightly.yml", "verify-signed-nightly"): "light",
+                        # the release-surface ack gate only waits for an environment approval: no key, no build
+                        ("nightly.yml", "await-release-surface-ack"): "light",
+                        # AUTO_RESUME's key-free jobs: preflight reads the source run with the job token,
+                        # verify-stapled launches the stapled DMG with no secret (the nightly-only runners take them)
+                        ("auto-resume-nightly-notarization.yml", "preflight"): "light",
+                        ("auto-resume-nightly-notarization.yml", "verify-stapled"): "light",
+                        # AUTO_RESUME_HOSTED_JOBS keep their hosted route, so no runner should see one. A class
+                        # anyway: with none they fall back to a compile (5 units, persistent-dd and a root), and
+                        # job_tier ranks this workflow nightly, so one 6 h poll reaching a general mini would pin
+                        # a canonical root ahead of every PR job. Light costs 2 units and no root.
+                        ("auto-resume-nightly-notarization.yml", "poll"): "light",
+                        ("auto-resume-nightly-notarization.yml", "poll-outer"): "light",
+                        ("auto-resume-nightly-notarization.yml", "poll-stapled"): "light",
                         ("nightly.yml", "verify-final-dmg-nightly"): "light",
                         # nightly-next's Linux signer path: its one Mac job builds the DMG from the signed app with
                         # hdiutil (cmux nightly.yml signer-dmg-image; was a compile, 5 units + persistent-dd + root)
@@ -1446,9 +1479,103 @@ def decide(event_name: str | None, event: Any, repository: str | None,
     return True, f"{event_name} on {repo or '(unknown)'}"
 
 
-# workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs.
+# workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs. The one
+# exception is ONE_MINI_NIGHTLY's, on a --trusted-next-signing runner only (trusted_refusal).
 TRUSTED_EVENTS = ("push", "schedule")
 UNTRUSTED_PAYLOAD_KEYS = ("pull_request", "workflow_run", "merge_group")
+TRUSTED_NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
+# ONE_MINI_NIGHTLY: main's classic nightly.yml signing and publishing jobs, which cmux routes to the trusted signing
+# runner (glaeda-trusted-next-signing) in one-mini mode. That runner already took main's push and schedule jobs; it
+# now takes these on a workflow_dispatch too (34 of the classic nightly's last 40 runs), from main's exact nightly.yml
+# only. Each signs or publishes the app main's own nightly.yml built at github.sha, never a ref from the dispatch's
+# inputs. Also main's nightly-next promotion jobs (a dispatch with promote_nightly_next_sha runs them): they push a
+# reviewed SHA to nightly-next with main's own checkout. All but verify-signed-nightly and await-release-surface-ack
+# are SIGNING_JOBS (exclusive class); those two hold no key and stay light.
+CLASSIC_SIGNING_JOBS = ("build-sign-notarize-nightly", "verify-signed-nightly", "publish-nightly",
+                        "generate-nightly-deltas", "republish-nightly-deltas", "promote-nightly-next",
+                        "promote-nightly-next-acked", "await-release-surface-ack")
+# AUTO_RESUME (ONE_MINI_NIGHTLY, 2026-11-05): main's auto-resume-nightly-notarization.yml continues a classic nightly
+# whose Apple notarization outlived the run. It is a workflow_run after main's nightly.yml run on main (or its
+# workflow_dispatch from main, with the source run's id as inputs), the last classic nightly work on Blacksmith. Its
+# workflow file is main's own, every job checks out refs/heads/main, and preflight checks the source run through the
+# API (nightly.yml, this repository, its head_sha, branch and attempt, a push, schedule or dispatch) before any other
+# job runs; the jobs read only that run's artifacts. So, on a --trusted-next-signing runner only, the payload's
+# workflow_run (otherwise refused here: UNTRUSTED_PAYLOAD_KEYS) is admitted when it names exactly main's nightly.yml
+# run on main of manaflow-ai/cmux, from a push, schedule or dispatch, with no pull request. Every job that holds a
+# key and does work (AUTO_RESUME_SIGNING_JOBS) is a SIGNING_JOBS entry: exclusive, on the trusted signing runner.
+# The three that only wait on Apple's notary queue (AUTO_RESUME_HOSTED_JOBS) are refused here and keep their hosted
+# route. The two key-free jobs (AUTO_RESUME_LIGHT_JOBS) are light, for the nightly-only runners
+# (glaeda-nightly-only-admit). The ubuntu jobs
+# run on a mini's /bin/bash 3.2: poll-outer, poll-stapled and publish since cmux #36561 (main 7badd980).
+AUTO_RESUME_FILE = "auto-resume-nightly-notarization.yml"
+AUTO_RESUME_WORKFLOW = f"manaflow-ai/cmux/.github/workflows/{AUTO_RESUME_FILE}"
+AUTO_RESUME_REF = "refs/heads/main"
+AUTO_RESUME_SOURCE_PATH = ".github/workflows/nightly.yml"
+AUTO_RESUME_SOURCE_EVENTS = ("push", "schedule", "workflow_dispatch")
+AUTO_RESUME_SIGNING_JOBS = tuple(job for workflow, job in SIGNING_JOBS if workflow == AUTO_RESUME_FILE)
+AUTO_RESUME_LIGHT_JOBS = ("preflight", "verify-stapled")
+# AUTO_RESUME_HOSTED_JOBS: the three jobs no runner cmux routes this workflow to admits, so they keep their
+# hosted route (the trusted signing runner refuses them; a general runner's own trust rules are unchanged, and
+# WORKFLOW_JOB_CLASSES above keeps them light there). Each holds the
+# ASC notary API key, but each only asks Apple whether a submission is done, and its timeout is Apple's queue rather
+# than work: poll 90 min, poll-outer and poll-stapled 360 min each (cmux auto-resume-nightly-notarization.yml).
+# No class puts them on the one nightly mini without stopping the nightly:
+#   - exclusive, the claim itself holds the whole mini for up to that long. Every yieldToExclusive dedicated runner
+#     there starts nothing while a claim is held (YIELD_TO_EXCLUSIVE, bound 3 h, then it refuses its own job), so
+#     the nightly, classic and NEXT, stops;
+#   - light, the claim is gone but the job's processes are not: an exclusive job needs no process of another job in
+#     any runner's _work before it may hold the mini (stray_job_processes), so a 6 h poll means every nightly
+#     signing job behind it waits SIGNING_DRAIN_WAIT_S and is then refused so the run's Blacksmith job signs.
+# Either way the mini sends signing to Blacksmith for hours, which is what the one-mini nightly exists to end, and
+# the 30 minute feed freshness bound cannot hold. cmux's workflow put these three on ubuntu for this reason ("Apple
+# queue latency never reserves signing workers"); they stay there. Taking them off Blacksmith too needs the waiting
+# split from the acting on the cmux side, so the mini is claimed for the stapling and not for Apple's queue.
+AUTO_RESUME_HOSTED_JOBS = ("poll", "poll-outer", "poll-stapled")
+
+
+def auto_resume_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                        workflow_ref: str | None) -> str | None:
+    """Why this is not main's exact auto-resume-nightly-notarization.yml after main's own nightly.yml run, or None.
+    Pure. Any job of it; the callers pick the jobs (AUTO_RESUME)."""
+    repo = "manaflow-ai/cmux"
+    if workflow_ref != f"{AUTO_RESUME_WORKFLOW}@{AUTO_RESUME_REF}" or ref != AUTO_RESUME_REF:
+        return f"not {repo}'s {AUTO_RESUME_FILE} from {AUTO_RESUME_REF}"
+    if not isinstance(event, dict):
+        return "the event payload is missing"
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
+    if repos != {repo}:
+        return f"not {repo}"
+    if any(key in event for key in ("pull_request", "merge_group")):
+        return "the payload carries a pull request or merge group"
+    if event_name == "workflow_dispatch":
+        if "workflow_run" in event or event.get("ref") != AUTO_RESUME_REF:
+            return f"a dispatch only of {AUTO_RESUME_REF}'s own copy"
+        return None
+    if event_name != "workflow_run":
+        return f"{AUTO_RESUME_FILE} runs only on workflow_run or workflow_dispatch, not {event_name}"
+    run = event.get("workflow_run")
+    repository_doc = event.get("repository")
+    if f"refs/heads/{repository_doc.get('default_branch') if isinstance(repository_doc, dict) else None}" \
+            != AUTO_RESUME_REF:
+        return f"a workflow_run runs on the default branch, which is not {AUTO_RESUME_REF}"
+    if event.get("action") != "completed" or not isinstance(run, dict):
+        return "a workflow_run without a completed run"
+    if (run.get("path") != AUTO_RESUME_SOURCE_PATH or run.get("head_branch") != "main"
+            or _repo_name(run.get("head_repository")) != repo or _repo_name(run.get("repository")) != repo
+            or run.get("event") not in AUTO_RESUME_SOURCE_EVENTS):
+        return (f"the triggering run is not {repo}'s {AUTO_RESUME_SOURCE_PATH} on main from "
+                f"{', '.join(AUTO_RESUME_SOURCE_EVENTS)}")
+    # Not run["pull_requests"]: that is every pull request whose head is this run's commit, in any repository,
+    # so a push run on main lists each fork's open main-to-main sync pull request (cmux's nightly.yml run
+    # 37603581609, a push on main, listed four: nonomal, IrvanFza, ericmjl, HexSleeves) and a contributor's open
+    # pull request into our main lists too. Reading it as "this was a pull request run" refuses every real run,
+    # and no narrowing of it is sound either: an entry's url names its base repository, so our own main is the
+    # base of a contributor's, while its head.repo is ours for a fork's sync one (PullRequestMinimal carries
+    # id, name and url per side, never full_name). It would also buy nothing: the run's event above is already
+    # push, schedule or workflow_dispatch, which excludes a pull_request run, and its head_branch, both
+    # repositories and this payload's own pull_request and merge_group keys are checked. Bookkeeping about other
+    # refs cannot make this run's code untrusted.
+    return None
 
 
 def trusted_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -1462,7 +1589,18 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     if (trusted_next_nightly or trusted_next_signing) and (
             trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"):
         return "untrusted: NEXT nightly opt-in needs manaflow-ai/cmux trusted main admission"
-    if event_name not in TRUSTED_EVENTS:
+    if trusted_next_signing and event_name in ("workflow_run", "workflow_dispatch") \
+            and workflow_file(workflow_ref) == AUTO_RESUME_FILE:
+        # AUTO_RESUME: main's exact continuation after main's own nightly, only its key-holding jobs
+        resume_why = auto_resume_refusal(event_name, ref, repository, event, workflow_ref)
+        if resume_why:
+            return f"{why}; {AUTO_RESUME_FILE}: {resume_why}"
+        if job not in AUTO_RESUME_SIGNING_JOBS:
+            return f"{why}; {AUTO_RESUME_FILE} only for its key-holding jobs ({', '.join(AUTO_RESUME_SIGNING_JOBS)})"
+        return None
+    # ONE_MINI_NIGHTLY: a signing runner checks a dispatch below like a push: payload, exact workflow, job
+    dispatch = trusted_next_signing and event_name == "workflow_dispatch"
+    if event_name not in TRUSTED_EVENTS and not dispatch:
         return f"{why}, not {event_name}"
     if not isinstance(event, dict):
         return f"{why}; the event payload is missing"
@@ -1474,17 +1612,26 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     if (trusted_next_nightly or trusted_next_signing) and ref == "refs/heads/nightly-next":
         # A fixed exception, never a general extra-ref list. Schedules run on the default branch;
         # NEXT promotion reaches this runner only through the protected nightly-next push.
-        exact = (event_name == "push" and event.get("ref") == ref
-                 and workflow_ref == "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next")
-        if exact and trusted_next_nightly and run_attempt == "1" and job == "build-nightly-app":
+        exact = event.get("ref") == ref and workflow_ref == f"{TRUSTED_NIGHTLY_WORKFLOW}@refs/heads/nightly-next"
+        if exact and event_name == "push" and trusted_next_nightly and run_attempt == "1" \
+                and job == "build-nightly-app":
             return None
         # TRUSTED_NEXT_SIGNING: and nightly.yml's own signing and publishing jobs, on any attempt (a re-run has no
-        # other signer now). They take the exclusive class here like on any mini (SIGNING_JOBS).
-        if exact and trusted_next_signing and ("nightly.yml", job) in SIGNING_JOBS:
+        # other signer now). They take the exclusive class here like on any mini (SIGNING_JOBS). ONE_MINI_NIGHTLY:
+        # on a dispatch of that exact nightly.yml too, which cmux's one-mini mode also sends here.
+        if exact and event_name in ("push", "workflow_dispatch") and trusted_next_signing \
+                and ("nightly.yml", job) in SIGNING_JOBS:
             return None
         return ("untrusted: NEXT nightly needs its exact nightly.yml "
                 + " or ".join(filter(None, ("build-nightly-app push on attempt 1" if trusted_next_nightly else "",
-                                            "signing job push" if trusted_next_signing else ""))))
+                                            "signing job push or dispatch" if trusted_next_signing else ""))))
+    if dispatch:
+        # ONE_MINI_NIGHTLY: main's classic nightly signing and publishing jobs, from main's exact nightly.yml
+        if not (ref == trusted_ref and event.get("ref") == ref and workflow_ref == f"{TRUSTED_NIGHTLY_WORKFLOW}@{ref}"
+                and job in CLASSIC_SIGNING_JOBS):
+            return (f"{why}; a workflow_dispatch only for main's exact nightly.yml signing and publishing jobs "
+                    f"({', '.join(CLASSIC_SIGNING_JOBS)})")
+        return None
     if ref != trusted_ref:
         return f"{why}, not ref {ref or '(unset)'}"
     if event_name == "push" and event.get("ref") != trusted_ref:
@@ -1629,11 +1776,45 @@ def nightly_slot_refusal(tier: str) -> str | None:
             "main's nightly-next canary and launch smoke, and the Release compile that gates nightly-next's promotion)")
 
 
+def hosted_route_refusal(workflow_ref: str | None, job: str | None) -> str | None:
+    """Why no glaeda runner takes this job whatever its class, or None. Pure.
+
+    AUTO_RESUME_HOSTED_JOBS keep cmux's hosted route. Each only asks Apple whether a submission is done, so its
+    timeout is the notary queue rather than work (90, 360 and 360 minutes), and a runner that took one would hold a
+    slot on the one nightly runner for hours without doing any of the nightly's work. trusted_refusal and
+    glaeda-nightly-only-admit already refuse them, and job_tier gives them no tier so they cannot outrank a PR job,
+    but neither of those covers a general pool runner, which applies no trust check at all. This does, so the
+    invariant holds for every class: cmux routes these three to ubuntu, and if that ever changed by accident the job
+    is refused here and requeued rather than quietly parking a mini.
+
+    Scoped by the workflow file these jobs live in, and deliberately *not* by auto_resume_refusal: that one also
+    validates the triggering run's metadata, which says nothing about which job this is. Gating on it left a hole,
+    since a poll of exactly this workflow whose source run was malformed got no refusal here and the general pool
+    applies no other check. Nor by the ref: no copy of these three on any branch does work a runner should take, and
+    a workflow_dispatch of this file from another branch would otherwise escape (a workflow_run always runs on the
+    default branch, so only a dispatch gets here). The file and the job name decide, so neither a bad payload nor an
+    off-main dispatch can buy a mini-long park, while a job merely sharing one of those names in another workflow is
+    untouched.
+    """
+    if job in AUTO_RESUME_HOSTED_JOBS and workflow_file(workflow_ref) == AUTO_RESUME_FILE:
+        return (f"{AUTO_RESUME_FILE}'s {job} keeps its hosted route: it only waits on Apple's notary queue, so no "
+                f"glaeda runner takes one ({', '.join(AUTO_RESUME_HOSTED_JOBS)})")
+    return None
+
+
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
              workflow_ref: str | None, job: str | None) -> str:
     """This job's admission tier (FEED_FIRST): TIER_NIGHTLY, TIER_DEV or "". Pure. Only merged workflow code on a
     protected branch qualifies: the workflow ref names the same branch the job runs on, and a pull request's ref is
-    never one of them, nor is a payload that carries a pull request, a workflow_run or a merge group."""
+    never one of them, nor is a payload that carries a pull request, a workflow_run or a merge group. The one
+    workflow_run is AUTO_RESUME's exact continuation of main's own nightly (auto_resume_refusal)."""
+    if job and auto_resume_refusal(event_name, ref, repository, event, workflow_ref) is None:
+        # AUTO_RESUME_HOSTED_JOBS rank no tier: each only asks Apple whether a submission is done, so its timeout is
+        # the notary queue rather than work (90, 360 and 360 minutes). cmux runs all three on ubuntu and the two
+        # runner classes that check trust refuse them (trusted_refusal, glaeda-nightly-only-admit), but a general pool
+        # runner applies neither, and FEED_FIRST would then put a six-hour wait ahead of every PR job on that mini.
+        # Their light class keeps the cost at 2 units and no root; this keeps them out of the priority order too.
+        return "" if job in AUTO_RESUME_HOSTED_JOBS else TIER_NIGHTLY
     if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
         return ""
     if dev_compile_refusal(event_name, ref, repository, event, workflow_ref, job) is None:
@@ -9358,7 +9539,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
     p.add_argument("--trusted-next-signing", action="store_true",
                    help="also admit cmux nightly-next's own nightly.yml signing and publishing jobs (SIGNING_JOBS) "
-                        "on its push, any attempt, which drain the mini like the nightly slot's (TRUSTED_NEXT_SIGNING)")
+                        "on its push or dispatch, any attempt, main's nightly.yml CLASSIC_SIGNING_JOBS on its "
+                        "dispatch, and main's auto-resume-nightly-notarization.yml AUTO_RESUME_SIGNING_JOBS on its "
+                        "workflow_run after main's nightly or its dispatch, which drain the mini like the nightly "
+                        "slot's (TRUSTED_NEXT_SIGNING, ONE_MINI_NIGHTLY, AUTO_RESUME)")
     p.add_argument("--yield-to-exclusive", action="store_true",
                    help="job-started, a dedicated runner: start no job while a signing job on this mini waits for "
                         "it to drain or holds it (YIELD_TO_EXCLUSIVE)")
@@ -9570,6 +9754,9 @@ def main(argv: list[str] | None = None) -> int:
             return refused(f"the gateway runner takes only thin cmux-ci client jobs ({gateway_jobs_note()}); "
                            f"{job_workflow() or 'an unknown workflow'} {os.environ.get('GITHUB_JOB') or 'job'} "
                            "is not one")
+        # every class, the general pool included: a job cmux routes to a hosted runner is never taken here
+        if why := hosted_route_refusal(os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")):
+            return refused(why)
         if args.nightly_runner:
             why = nightly_slot_refusal(job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                                 os.environ.get("GITHUB_REPOSITORY"), event,

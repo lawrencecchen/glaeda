@@ -13,6 +13,7 @@ import contextlib
 import copy
 import datetime
 import fcntl
+import functools
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -586,13 +587,34 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 8)
+        self.assertEqual(len(signing), 17)
+        # ONE_MINI_NIGHTLY: a dispatched nightly-next run (cmux one-mini mode sends its signing jobs here too) signs
+        # here like its push; its payload names the same ref
+        dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
+                    "workflow": ".github/workflows/nightly.yml"}
         for job in signing:
             for attempt in ("1", "2"):  # a re-run signs here too: there is no other signer now
-                with self.subTest(job=job, attempt=attempt):
-                    self.assertIsNone(hook.trusted_refusal(**{**args, "job": job, "run_attempt": attempt}))
+                for event_name, payload_now in (("push", payload), ("workflow_dispatch", dispatch)):
+                    with self.subTest(job=job, attempt=attempt, event_name=event_name):
+                        self.assertIsNone(hook.trusted_refusal(**{**args, "job": job, "run_attempt": attempt,
+                                                                  "event_name": event_name,
+                                                                  "event": payload_now}))
+        for overrides in ({"trusted_next_signing": False}, {"event": {**dispatch, "ref": "refs/heads/main"}},
+                          {"event": {k: v for k, v in dispatch.items() if k != "ref"}},
+                          {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"},
+                          {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
+                          {"job": "build-nightly-app"}, {"job": "decide"}, {"job": None},
+                          *[{"event": {**dispatch, key: {}}} for key in ("pull_request", "workflow_run",
+                                                                          "merge_group")]):
+            with self.subTest(dispatch=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(
+                    **{**args, "event_name": "workflow_dispatch", "event": dispatch, **overrides}))
+        # trusted_next_nightly's app build stays push-only on attempt 1
+        self.assertIn("untrusted:", hook.trusted_refusal(
+            **{**args, "trusted_next_nightly": True, "trusted_next_signing": False, "event_name": "workflow_dispatch",
+               "event": dispatch, "job": "build-nightly-app"}))
         cases = [
-            {"trusted_next_signing": False}, {"event_name": "schedule"}, {"event_name": "workflow_dispatch"},
+            {"trusted_next_signing": False}, {"event_name": "schedule"},
             {"ref": "refs/heads/feat-cmux-next"}, {"repository": "manaflow-ai/other"},
             {"event": {**payload, "ref": "refs/heads/main"}},
             {"event": {**payload, "repository": {"full_name": "manaflow-ai/other"}}},
@@ -626,6 +648,466 @@ class HookTest(unittest.TestCase):
                                    "--trusted-next-signing", "--no-disk", *trusted,
                                    repo="manaflow-ai/cmux", env=environ)
             self.assertEqual(result.returncode == 0, bool(trusted), result.stdout + result.stderr)
+
+    def test_trusted_next_signing_admits_classic_nightly_signing_on_main(self) -> None:
+        # ONE_MINI_NIGHTLY (Lawrence, 2026-11-05): every classic and nightly-next nightly job on cmux15. main's own
+        # nightly.yml signing and publishing jobs (CLASSIC_SIGNING_JOBS) run on the trusted signing runner on its
+        # push, schedule and workflow_dispatch (34 of its last 40 runs were dispatched), from main's exact nightly.yml.
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"
+        repo = {**CMUX, "default_branch": "main"}
+        payloads = {"push": {"ref": ref, "repository": repo},
+                    "schedule": {"schedule": "17 */6 * * *", "repository": repo},
+                    "workflow_dispatch": {"ref": ref, "repository": repo, "inputs": {"force": "false"},
+                                          "workflow": ".github/workflows/nightly.yml"}}
+        args = {"ref": ref, "repository": "manaflow-ai/cmux", "trusted_ref": ref, "trusted_repo": "manaflow-ai/cmux",
+                "trusted_next_signing": True, "workflow_ref": workflow_ref, "run_attempt": "1"}
+        # and main's nightly-next promotion jobs (promote-nightly-next, promote-nightly-next-acked,
+        # await-release-surface-ack), which main's dispatch with promote_nightly_next_sha runs
+        self.assertEqual(set(hook.CLASSIC_SIGNING_JOBS),
+                         {"build-sign-notarize-nightly", "verify-signed-nightly", "publish-nightly",
+                          "generate-nightly-deltas", "republish-nightly-deltas", "promote-nightly-next",
+                          "promote-nightly-next-acked", "await-release-surface-ack"})
+        for job in hook.CLASSIC_SIGNING_JOBS:
+            for event_name, payload in payloads.items():
+                for attempt in ("1", "3"):
+                    with self.subTest(job=job, event_name=event_name, attempt=attempt):
+                        self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": payload,
+                                                                  "job": job, "run_attempt": attempt}))
+            # the jobs that hold a release key take the whole Mac; the verify and the ack gate hold none: light
+            want = "light" if job in ("verify-signed-nightly", "await-release-surface-ack") else hook.EXCLUSIVE_CLASS
+            self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "nightly.yml")[0], want)
+        dispatch = {**args, "event_name": "workflow_dispatch", "event": payloads["workflow_dispatch"],
+                    "job": "publish-nightly"}
+        cases = [
+            # a dispatch is admitted only on the signing runner, only for these jobs, only from main's nightly.yml
+            {"trusted_next_signing": False}, {"job": "build-nightly-app"}, {"job": "probe-nightly-tag-permission"},
+            {"job": "decide"}, {"job": "seed"}, {"job": None},
+            {"workflow_ref": None}, {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
+            {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/seed-derived-data.yml@{ref}"},
+            {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/feat-x"},
+            {"workflow_ref": f"other/cmux/.github/workflows/nightly.yml@{ref}"},
+            {"ref": "refs/heads/rc/1.2"}, {"ref": "refs/heads/feat-x"}, {"repository": "manaflow-ai/other"},
+            {"event": {**payloads["workflow_dispatch"], "ref": "refs/heads/feat-x"}},
+            {"event": {k: v for k, v in payloads["workflow_dispatch"].items() if k != "ref"}},
+            {"event": {**payloads["workflow_dispatch"], "repository": {"full_name": "manaflow-ai/other"}}},
+            {"event": None},
+            {"trusted_ref": "refs/heads/feat-x"}, {"trusted_repo": "manaflow-ai/other"},
+            {"event_name": "pull_request"}, {"event_name": "pull_request_target"}, {"event_name": "workflow_run"},
+            {"event_name": "merge_group"}, {"event_name": "repository_dispatch"},
+            *[{"event": {**payloads["workflow_dispatch"], key: {}}}
+              for key in ("pull_request", "workflow_run", "merge_group")],
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**dispatch, **overrides}))
+        # a plain trusted main runner (no signing opt-in) still refuses every dispatch, as before
+        plain = {k: v for k, v in dispatch.items() if k != "trusted_next_signing"}
+        self.assertIn("not workflow_dispatch", hook.trusted_refusal(**plain))
+        # main's push and schedule jobs stay admitted as before (any merged workflow on main)
+        for event_name in ("push", "schedule"):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": payloads[event_name],
+                                                      "job": "seed", "workflow_ref": None}))
+        path = event(self.dir, "classic-dispatch", payloads["workflow_dispatch"])
+        environ = {"GITHUB_REF": ref, "GITHUB_WORKFLOW_REF": workflow_ref, "GITHUB_JOB": "generate-nightly-deltas",
+                   "GITHUB_RUN_ATTEMPT": "1"}
+        for flags, admitted in ((("--trusted-next-signing",), True), ((), False)):
+            result = self.run_hook("job-started", "workflow_dispatch", path, "--allowed-owner", "manaflow-ai",
+                                   "--trusted-ref", ref, "--trusted-repo", "manaflow-ai/cmux", *flags, "--no-disk",
+                                   repo="manaflow-ai/cmux", env=environ)
+            self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+
+    def test_nightly_next_key_jobs_are_exclusive_signing_jobs(self) -> None:
+        # ONE_MINI_NIGHTLY: nightly-next's short jobs that hold a release key (cmux
+        # tests/test_nightly_owned_minis_only.py PENDING_GLAEDA) run on the trusted signing runner in the exclusive
+        # class, like the other SIGNING_JOBS: one drain of the Mac per job
+        ref = "refs/heads/nightly-next"
+        payload = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}}
+        args = {"event_name": "push", "ref": ref, "repository": "manaflow-ai/cmux", "event": payload,
+                "trusted_ref": "refs/heads/main", "trusted_repo": "manaflow-ai/cmux", "trusted_next_signing": True,
+                "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "run_attempt": "1"}
+        for job in ("promote-nightly-next-acked", "keep-published-dsyms", "sentry-dsyms-nightly",
+                    "sign-release-notes", "publish-release-notes", "publish-nightly-reel",
+                    "publish-nightly-identity-legacy", "republish-nightly-deltas", "legacy-identity-target"):
+            with self.subTest(job=job):
+                self.assertIn(("nightly.yml", job), hook.SIGNING_JOBS)
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "nightly.yml")[0],
+                                 hook.EXCLUSIVE_CLASS)
+                self.assertIsNone(hook.trusted_refusal(**{**args, "job": job}))
+                # another workflow's job of the same id is not a signing job
+                self.assertNotEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "ci.yml")[0],
+                                    hook.EXCLUSIVE_CLASS)
+
+    def test_trusted_next_signing_admits_classic_auto_resume_on_main(self) -> None:
+        # ONE_MINI_NIGHTLY, AUTO_RESUME: main's auto-resume-nightly-notarization.yml (workflow_run after main's
+        # nightly.yml run on main, or its workflow_dispatch from main) is the last classic nightly work on Blacksmith.
+        # Its key-holding jobs that also run on macOS take the trusted signing runner in the exclusive class; its two
+        # key-free jobs are light (the nightly-only runners take them, glaeda-nightly-only-admit).
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        repo = {**CMUX, "default_branch": "main"}
+        source = {"id": 41790985234, "name": "Nightly macOS build", "path": ".github/workflows/nightly.yml",
+                  "head_branch": "main", "head_sha": "a" * 40, "event": "workflow_dispatch",
+                  "conclusion": "failure", "run_attempt": 1, "pull_requests": [],
+                  "head_repository": dict(CMUX), "repository": dict(CMUX)}
+        run_payload = {"action": "completed", "workflow_run": source, "repository": repo,
+                       "workflow": {"path": ".github/workflows/nightly.yml"}}
+        dispatch_payload = {"ref": ref, "repository": repo,
+                            "workflow": ".github/workflows/auto-resume-nightly-notarization.yml",
+                            "inputs": {"source_run_id": "41790985234", "source_run_attempt": "1",
+                                       "source_head_sha": "a" * 40, "source_branch": "main"}}
+        payloads = {"workflow_run": run_payload, "workflow_dispatch": dispatch_payload}
+        args = {"ref": ref, "repository": "manaflow-ai/cmux", "trusted_ref": ref, "trusted_repo": "manaflow-ai/cmux",
+                "trusted_next_signing": True, "workflow_ref": workflow_ref, "run_attempt": "1"}
+        # cmux #36561 (main 7badd980) made poll-outer, poll-stapled and publish run on a mini's /bin/bash 3.2
+        signing = ("wait-and-staple", "staple-outer", "staple-stapled", "publish", "generate-deltas",
+                   "republish-deltas")
+        # AUTO_RESUME_HOSTED_JOBS: a key, but only Apple's queue to wait on, so they keep their hosted route
+        polls = ("poll", "poll-outer", "poll-stapled")
+        self.assertEqual(set(hook.AUTO_RESUME_SIGNING_JOBS), set(signing))
+        self.assertEqual(set(hook.AUTO_RESUME_HOSTED_JOBS), set(polls))
+        self.assertEqual(set(hook.AUTO_RESUME_LIGHT_JOBS), {"preflight", "verify-stapled"})
+        for job in polls:
+            self.assertNotIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)
+            # the trusted signing runner refuses them
+            for event_name, payload in payloads.items():
+                with self.subTest(hosted=job, event_name=event_name):
+                    why = hook.trusted_refusal(**{**args, "event_name": event_name, "event": payload, "job": job})
+                    self.assertIsNotNone(why)
+                    self.assertIn("untrusted:", why)
+            # and they are never an exclusive claim, nor a compile: with no class they would fall back to one
+            # (5 units, persistent-dd and a root), and job_tier ranks this workflow nightly, so a 6 h poll
+            # reaching any mini would pin a canonical root ahead of every PR job
+            self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
+                                            "auto-resume-nightly-notarization.yml")[0], "light")
+        for job in hook.AUTO_RESUME_SIGNING_JOBS:
+            if job in signing:
+                self.assertIn(("auto-resume-nightly-notarization.yml", job), hook.SIGNING_JOBS)
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
+                                                "auto-resume-nightly-notarization.yml")[0], hook.EXCLUSIVE_CLASS)
+            for event_name, payload in payloads.items():
+                for attempt in ("1", "2"):
+                    with self.subTest(job=job, event_name=event_name, attempt=attempt):
+                        self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": payload,
+                                                                  "job": job, "run_attempt": attempt}))
+                        # a nightly job (FEED_FIRST): it drains the mini for SIGNING_DRAIN_WAIT_S, not 300 s
+                        self.assertEqual(hook.job_tier(event_name, ref, "manaflow-ai/cmux", payload, workflow_ref,
+                                                       job), hook.TIER_NIGHTLY)
+        # A run's pull_requests is every pull request whose head is its commit, in any repository, so a push
+        # run on main lists each fork's open main-to-main sync pull request. These four are the verbatim
+        # entries of cmux's nightly.yml run 37603581609 (a push on main, 2026-10-07), in GitHub's real shape:
+        # PullRequestMinimal, whose per-side repo carries id, name and url and never full_name, and whose
+        # head.repo is manaflow-ai/cmux (the fork is the base). So no reading of this list tells our code from
+        # a fork's, and it is not consulted at all; such a run is admitted.
+        forks = [{"id": pid, "number": n, "url": f"https://api.github.com/repos/{owner}/cmux/pulls/{n}",
+                  "head": {"ref": "main", "sha": "5d12d7b4087fffbac3a90d638768823adddbd054",
+                           "repo": {"id": 1144115288, "name": "cmux",
+                                    "url": "https://api.github.com/repos/manaflow-ai/cmux"}},
+                  "base": {"ref": "main", "sha": "5d12d7b4087fffbac3a90d638768823adddbd054",
+                           "repo": {"id": fid, "name": "cmux",
+                                    "url": f"https://api.github.com/repos/{owner}/cmux"}}}
+                 for owner, n, pid, fid in (("nonomal", 5, 3842472500, 1264114693),
+                                            ("IrvanFza", 53, 3434148026, 1264114694),
+                                            ("ericmjl", 4, 3433951196, 1264114695),
+                                            ("HexSleeves", 24, 3433623160, 1264114696))]
+        # and a contributor's own pull request into our main, whose url and base are ours, is equally not a
+        # reason to refuse: the run's event is still a push of main's own commit
+        ours = [{"id": 1, "number": 7000, "url": "https://api.github.com/repos/manaflow-ai/cmux/pulls/7000",
+                 "head": {"ref": "main", "repo": {"id": 999, "name": "cmux",
+                                                  "url": "https://api.github.com/repos/contributor/cmux"}},
+                 "base": {"ref": "main", "repo": {"id": 1144115288, "name": "cmux",
+                                                  "url": "https://api.github.com/repos/manaflow-ai/cmux"}}}]
+        for name, pulls in (("forks", forks), ("ours", ours), ("empty", []), ("absent", None)):
+            for job in signing:
+                with self.subTest(pulls=name, job=job):
+                    run = {**source, "event": "push"}
+                    if pulls is None:
+                        run.pop("pull_requests", None)
+                    else:
+                        run["pull_requests"] = pulls
+                    self.assertIsNone(hook.trusted_refusal(
+                        **{**args, "event_name": "workflow_run", "job": job,
+                           "event": {**run_payload, "workflow_run": run}}))
+        for job in hook.AUTO_RESUME_LIGHT_JOBS:
+            self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
+                                            "auto-resume-nightly-notarization.yml")[0], "light")
+        # not on the trusted signing runner: the key-free jobs (their own route) and jobs the workflow does not have
+        for job in ("preflight", "verify-stapled", "decide", None):
+            with self.subTest(refused_job=job):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**args, "event_name": "workflow_run",
+                                                                    "event": run_payload, "job": job}))
+        base = {**args, "event_name": "workflow_run", "event": run_payload, "job": "wait-and-staple"}
+
+        def run_with(**changes):
+            return {**run_payload, "workflow_run": {**source, **changes}}
+        cases = [
+            {"trusted_next_signing": False}, {"trusted_ref": "refs/heads/feat-x"},
+            {"trusted_repo": "manaflow-ai/other"}, {"repository": "manaflow-ai/other"},
+            {"ref": "refs/heads/feat-x"}, {"ref": "refs/heads/nightly-next"}, {"workflow_ref": None},
+            {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@refs/heads/feat-x"},
+            {"workflow_ref": f"other/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"},
+            {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/ci.yml@{ref}"},
+            {"event_name": "pull_request"}, {"event_name": "pull_request_target"}, {"event_name": "merge_group"},
+            {"event_name": "repository_dispatch"}, {"event": None},
+            # the run that triggered it: main's own nightly.yml, on main, from manaflow-ai/cmux, never a PR's run
+            {"event": run_with(path=".github/workflows/ci.yml")},
+            {"event": run_with(path=".github/workflows/nightly.yml@refs/heads/feat-x")},
+            {"event": run_with(head_branch="nightly-next")}, {"event": run_with(head_branch="rc/1.2")},
+            {"event": run_with(head_branch="feat-x")},
+            {"event": run_with(head_repository={"full_name": "someone/cmux", "fork": True})},
+            {"event": run_with(repository={"full_name": "manaflow-ai/other"})},
+            {"event": run_with(event="pull_request")}, {"event": run_with(event="pull_request_target")},
+            {"event": run_with(event="workflow_run")},
+            {"event": {**run_payload, "workflow_run": None}},
+            {"event": {k: v for k, v in run_payload.items() if k != "workflow_run"}},
+            {"event": {**run_payload, "action": "requested"}},
+            {"event": {**run_payload, "repository": {**repo, "default_branch": "feat-x"}}},
+            {"event": {**run_payload, "repository": {"full_name": "manaflow-ai/other", "default_branch": "main"}}},
+            *[{"event": {**run_payload, key: {}}} for key in ("pull_request", "merge_group")],
+            # its dispatch: from main's own copy only, never a branch's
+            {"event_name": "workflow_dispatch", "event": {**dispatch_payload, "ref": "refs/heads/feat-x"}},
+            {"event_name": "workflow_dispatch", "event": {k: v for k, v in dispatch_payload.items() if k != "ref"}},
+            {"event_name": "workflow_dispatch", "event": {**dispatch_payload, "workflow_run": source}},
+            {"event_name": "workflow_dispatch", "event": dispatch_payload, "ref": "refs/heads/feat-x",
+             "workflow_ref": f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@refs/heads/feat-x"},
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**base, **overrides}))
+                if "trusted_next_signing" not in overrides and "trusted_ref" not in overrides \
+                        and "trusted_repo" not in overrides:
+                    # and none of them ranks as a nightly job
+                    got = {**base, **overrides}
+                    self.assertEqual(hook.job_tier(got["event_name"], got["ref"], got["repository"], got["event"],
+                                                   got["workflow_ref"], got["job"]), "")
+        # a plain trusted main runner (no signing opt-in) still refuses every workflow_run and dispatch
+        plain = {k: v for k, v in base.items() if k != "trusted_next_signing"}
+        self.assertIn("not workflow_run", hook.trusted_refusal(**plain))
+        self.assertIn("not workflow_dispatch", hook.trusted_refusal(**{**plain, "event_name": "workflow_dispatch",
+                                                                       "event": dispatch_payload}))
+        for event_name, payload in payloads.items():
+            path = event(self.dir, f"auto-resume-{event_name}", payload)
+            environ = {"GITHUB_REF": ref, "GITHUB_WORKFLOW_REF": workflow_ref, "GITHUB_JOB": "wait-and-staple",
+                       "GITHUB_RUN_ATTEMPT": "1"}
+            for flags, admitted in ((("--trusted-next-signing",), True), ((), False)):
+                with self.subTest(cli=event_name, flags=flags):
+                    result = self.run_hook("job-started", event_name, path, "--allowed-owner", "manaflow-ai",
+                                           "--trusted-ref", ref, "--trusted-repo", "manaflow-ai/cmux", *flags,
+                                           "--no-disk", repo="manaflow-ai/cmux", env=environ)
+                    self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+
+    def test_classic_auto_resume_hosted_polls_are_refused_though_the_source_run_is_malformed(self) -> None:
+        """A poll of exactly this workflow is refused on the common path whatever its triggering run looks like.
+
+        The refusal is scoped by the workflow's own identity, not by auto_resume_refusal: that one also validates
+        the triggering run's metadata, which says nothing about which job this is. While it gated this refusal, a
+        poll of exactly this workflow whose source run was malformed got no refusal here, and a general pool runner
+        applies no other check, so a bad payload bought a mini-long park on Apple's notary queue.
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        env = {"GITHUB_WORKFLOW_REF": workflow_ref, "GITHUB_REF": ref, "GITHUB_RUN_ATTEMPT": "1"}
+        good = {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                "head_repository": dict(CMUX), "repository": dict(CMUX)}
+        # each of these makes auto_resume_refusal refuse, so none of them may decide this one
+        bad_runs = {
+            "a source path that is not the nightly": {**good, "path": ".github/workflows/something-else.yml"},
+            "a source branch that is not main": {**good, "head_branch": "topic"},
+            "a source event that is not a push": {**good, "event": "pull_request"},
+            "a forked source repository": {**good, "head_repository": {"full_name": "someone/cmux"}},
+            "no source run at all": None,
+            "a source run of the wrong type": "not-a-dict",
+        }
+        for name, run in bad_runs.items():
+            payload = {"action": "completed", "repository": {**CMUX, "default_branch": "main"}}
+            if run is not None:
+                payload["workflow_run"] = run
+            path = event(self.dir, f"auto-resume-malformed-{abs(hash(name))}", payload)
+            for job in hook.AUTO_RESUME_HOSTED_JOBS:
+                with self.subTest(source=name, job=job):
+                    self.assertIsNotNone(hook.auto_resume_refusal("workflow_run", ref, "manaflow-ai/cmux",
+                                                                  payload, workflow_ref),
+                                         "this fixture is meant to be a run auto_resume_refusal refuses")
+                    # the pure gate decides on identity alone, so it refuses whatever the payload holds
+                    self.assertIsNotNone(hook.hosted_route_refusal(workflow_ref, job))
+                    # and on the common path the job is refused, by this guard or by an earlier one that
+                    # rejects the malformed payload outright; either way no mini takes it
+                    got = self.run_hook("job-started", "workflow_run", path, "--allowed-repo", "manaflow-ai/cmux",
+                                        "--no-disk", repo="manaflow-ai/cmux", env={**env, "GITHUB_JOB": job})
+                    self.assertNotEqual(got.returncode, 0, got.stdout + got.stderr)
+                    self.assertIn("refused", got.stdout)
+
+    def test_hosted_route_refusal_leaves_another_workflows_job_of_the_same_name_alone(self) -> None:
+        # the scope is the workflow's identity, so a job named "poll" elsewhere is still admitted
+        ref = "refs/heads/main"
+        for name, wf in {
+            "another workflow on main": f"manaflow-ai/cmux/.github/workflows/ci.yml@{ref}",
+            "a workflow whose name merely ends the same way":
+                f"manaflow-ai/cmux/.github/workflows/not-auto-resume-nightly-notarization.yml@{ref}",
+            "no workflow ref": None,
+            "not a workflow ref at all": "manaflow-ai/cmux@refs/heads/main",
+        }.items():
+            for job in hook.AUTO_RESUME_HOSTED_JOBS:
+                with self.subTest(untouched=name, job=job):
+                    self.assertIsNone(hook.hosted_route_refusal(wf, job))
+        # this file's copy is refused on every ref, not only main: a workflow_dispatch of it from another
+        # branch would otherwise park a mini for the length of Apple's queue, and no ref's copy of these
+        # three does work a runner should take
+        for branch in ("refs/heads/main", "refs/heads/topic", "refs/tags/v1", "refs/pull/7/merge"):
+            for job in hook.AUTO_RESUME_HOSTED_JOBS:
+                with self.subTest(refused_on=branch, job=job):
+                    self.assertIsNotNone(hook.hosted_route_refusal(
+                        f"manaflow-ai/cmux/.github/workflows/"
+                        f"auto-resume-nightly-notarization.yml@{branch}", job))
+        # and a job of this file that does the nightly's work is still untouched on every ref
+        for branch in ("refs/heads/main", "refs/heads/topic"):
+            for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
+                with self.subTest(works=job, ref=branch):
+                    self.assertIsNone(hook.hosted_route_refusal(
+                        f"manaflow-ai/cmux/.github/workflows/"
+                        f"auto-resume-nightly-notarization.yml@{branch}", job))
+
+    def test_classic_auto_resume_hosted_polls_are_refused_on_every_runner_class(self) -> None:
+        """No glaeda runner class takes poll, poll-outer or poll-stapled, the general pool included.
+
+        An empty job_tier only stops them outranking a PR job; it refuses nothing on the common path, and a
+        general pool runner applies no trust check, so without hosted_route_refusal one routed here by accident
+        would be admitted and hold a slot for as long as Apple's notary queue kept it (90, 360, 360 minutes).
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        source = {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                  "head_repository": dict(CMUX), "repository": dict(CMUX)}
+        payload = {"action": "completed", "repository": {**CMUX, "default_branch": "main"},
+                   "workflow_run": dict(source)}
+        env = {"GITHUB_WORKFLOW_REF": workflow_ref, "GITHUB_REF": ref, "GITHUB_RUN_ATTEMPT": "1"}
+        path = event(self.dir, "auto-resume-hosted", payload)
+        for job in hook.AUTO_RESUME_HOSTED_JOBS:
+            # the common path: a plain pool runner, no trust flag of any kind
+            with self.subTest(general_pool=job):
+                got = self.run_hook("job-started", "workflow_run", path, "--allowed-repo", "manaflow-ai/cmux",
+                                    "--no-disk", repo="manaflow-ai/cmux",
+                                    env={**env, "GITHUB_JOB": job})
+                self.assertNotEqual(got.returncode, 0, got.stdout + got.stderr)
+                self.assertIn("keeps its hosted route", got.stdout)
+            # and the trusted signing runner, which refuses it for its own reason as well
+            with self.subTest(trusted_signing=job):
+                self.assertIsNotNone(hook.trusted_refusal(
+                    "workflow_run", ref, "manaflow-ai/cmux", payload, ref, "manaflow-ai/cmux",
+                    trusted_next_signing=True, workflow_ref=workflow_ref, job=job, run_attempt="1"))
+            # the pure gate, for every class at once
+            with self.subTest(any_class=job):
+                self.assertIsNotNone(hook.hosted_route_refusal(workflow_ref, job))
+        # a job that does the nightly's work is untouched, so this refuses by name rather than refusing the
+        # whole workflow
+        for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
+            with self.subTest(works=job):
+                self.assertIsNone(hook.hosted_route_refusal(workflow_ref, job))
+        # a job merely sharing the name in another workflow is untouched: the scope is this workflow file
+        with self.subTest(elsewhere="nightly.yml"):
+            self.assertIsNone(hook.hosted_route_refusal(
+                f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "poll"))
+        # but this file's own copy is refused on any ref, not only main: a workflow_dispatch of it from another
+        # branch reaches a runner with GITHUB_REF set to that branch, and no ref's copy of these three does work
+        # a runner should take
+        with self.subTest(elsewhere="this file off main"):
+            self.assertIsNotNone(hook.hosted_route_refusal(
+                "manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@refs/heads/other",
+                "poll"))
+
+    def test_classic_auto_resume_hosted_polls_rank_no_tier_on_any_runner(self) -> None:
+        """AUTO_RESUME_HOSTED_JOBS get no FEED_FIRST tier, so a pool runner cannot prioritise a 6 h Apple wait.
+
+        cmux runs poll, poll-outer and poll-stapled on ubuntu, and the two runner classes that check trust
+        refuse them (trusted_refusal here, glaeda-nightly-only-admit's refusal in its own suite). A general
+        pool runner applies neither check, so if one ever reached a mini it would be admitted; job_tier must
+        then not rank it, or FEED_FIRST would put a job whose timeout is the notary queue (90, 360, 360
+        minutes) ahead of every PR job on that mini. The jobs that do work with a key still rank nightly.
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        event = {"action": "completed", "repository": {**CMUX, "default_branch": "main"},
+                 "workflow_run": {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                                  "head_repository": dict(CMUX), "repository": dict(CMUX)}}
+        tier = functools.partial(hook.job_tier, "workflow_run", ref, "manaflow-ai/cmux", event, workflow_ref)
+        # the payload is the admitted one, so a "" below is the job's own doing and not a refused payload
+        self.assertIsNone(hook.auto_resume_refusal("workflow_run", ref, "manaflow-ai/cmux", event, workflow_ref))
+        for job in hook.AUTO_RESUME_HOSTED_JOBS:
+            with self.subTest(hosted=job):
+                self.assertEqual(tier(job), "", "an Apple-queue wait never outranks a PR job")
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
+                                                hook.AUTO_RESUME_FILE)[0], "light",
+                                 "and it costs a light job, not a compile with a canonical root")
+        for job in (*hook.AUTO_RESUME_SIGNING_JOBS, *hook.AUTO_RESUME_LIGHT_JOBS):
+            with self.subTest(works=job):
+                self.assertEqual(tier(job), hook.TIER_NIGHTLY, "a job that does the nightly's work still ranks")
+
+    def test_classic_auto_resume_refuses_malformed_source_metadata(self) -> None:
+        """AUTO_RESUME fails closed on every missing, null or wrong-typed field of the triggering run.
+
+        The gate no longer reads the run's `pull_requests` (that list is every pull request whose head is this
+        run's commit, in any repository, so it says nothing about this run's code: see auto_resume_refusal).
+        What stands in its place are the checks below, and each one must refuse rather than admit when the
+        payload does not carry what it reads. Together they pin that an auto-resume job is admitted only when
+        the triggering run is positively identified as main's own nightly.yml run of this repository: a field
+        that is absent, null, empty or of another type can never satisfy one of them.
+        """
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/auto-resume-nightly-notarization.yml@{ref}"
+        source = {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "push",
+                  "head_repository": dict(CMUX), "repository": dict(CMUX)}
+        payload = {"action": "completed", "repository": {**CMUX, "default_branch": "main"}}
+        args = {"ref": ref, "repository": "manaflow-ai/cmux", "trusted_ref": ref,
+                "trusted_repo": "manaflow-ai/cmux", "trusted_next_signing": True, "workflow_ref": workflow_ref,
+                "run_attempt": "1", "event_name": "workflow_run", "job": "publish"}
+        # the well-formed run is admitted, so each case below refuses for its own change and nothing else
+        self.assertIsNone(hook.trusted_refusal(**{**args, "event": {**payload, "workflow_run": dict(source)}}))
+        # every field auto_resume_refusal reads, each absent, null, empty and wrong-typed
+        for field in ("path", "head_branch", "event", "head_repository", "repository"):
+            for name, change in (("absent", ...), ("null", None), ("empty dict", {}), ("empty str", ""),
+                                 ("a string", "manaflow-ai/cmux"), ("a list", []), ("a number", 1),
+                                 ("full_name not a string", {"full_name": 1})):
+                run = dict(source)
+                if change is ...:
+                    run.pop(field)
+                else:
+                    run[field] = change
+                with self.subTest(field=field, shape=name):
+                    why = hook.trusted_refusal(**{**args, "event": {**payload, "workflow_run": run}})
+                    self.assertIsNotNone(why, f"{field} {name} must refuse")
+                    self.assertIn("untrusted:", why)
+        # the run object itself, and the payload around it
+        for name, event in (("workflow_run absent", {k: v for k, v in payload.items()}),
+                            ("workflow_run null", {**payload, "workflow_run": None}),
+                            ("workflow_run empty", {**payload, "workflow_run": {}}),
+                            ("workflow_run a string", {**payload, "workflow_run": "x"}),
+                            ("workflow_run a list", {**payload, "workflow_run": []}),
+                            ("action absent", {"repository": {**CMUX, "default_branch": "main"},
+                                               "workflow_run": dict(source)}),
+                            ("action null", {**payload, "action": None, "workflow_run": dict(source)}),
+                            ("payload repository null", {**payload, "repository": None,
+                                                         "workflow_run": dict(source)}),
+                            ("payload repository empty", {**payload, "repository": {},
+                                                          "workflow_run": dict(source)}),
+                            ("default_branch absent", {**payload, "repository": dict(CMUX),
+                                                       "workflow_run": dict(source)}),
+                            ("default_branch null", {**payload, "repository": {**CMUX, "default_branch": None},
+                                                     "workflow_run": dict(source)}),
+                            ("payload null", None), ("payload a string", "x"), ("payload a list", [])):
+            with self.subTest(payload=name):
+                why = hook.trusted_refusal(**{**args, "event": event})
+                self.assertIsNotNone(why, f"{name} must refuse")
+                self.assertIn("untrusted:", why)
+        # and a pull_requests of any shape changes nothing: it is not read, so a malformed one neither
+        # admits a run the checks above refuse nor refuses one they admit
+        for pulls in (None, [], {}, "many", [None], [{}], [{"number": 1}], [{"head": {}, "base": {}}],
+                      [{"head": None, "base": None}], [{"url": None}], 42):
+            with self.subTest(pull_requests=pulls):
+                self.assertIsNone(hook.trusted_refusal(
+                    **{**args, "event": {**payload, "workflow_run": {**source, "pull_requests": pulls}}}))
+                self.assertIsNotNone(hook.trusted_refusal(
+                    **{**args, "event": {**payload, "workflow_run": {**source, "pull_requests": pulls,
+                                                                     "head_branch": "nightly-next"}}}))
 
     def test_dev_compile_runner_is_exact_job_and_event(self) -> None:
         workflow = "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"
@@ -11023,21 +11505,42 @@ class RunnerTest(unittest.TestCase):
         self.addCleanup(retry.stop)
         return hooks
 
+    ABSENT_BRANCH = object()  # a runs row with no head_branch key at all
+
     @staticmethod
-    def runs_page(url: str, runs: list[tuple[int, str, str]]) -> str:
-        """GitHub's runs list as the API pages it: newest first by creation, filtered by `status=`, 100 a page."""
+    def _run_row(row: tuple) -> tuple[int, str, str, str, str]:
+        """(id, status, head sha) with the defaults a SIGN_HOLD test needs, or the full
+        (id, status, head sha, workflow, branch)."""
+        return row if len(row) == 5 else (*row, "nightly.yml", "nightly-next")
+
+    @classmethod
+    def runs_page(cls, url: str, runs: list[tuple]) -> str:
+        """GitHub's runs list as the API pages it: newest first by creation, filtered by `status=`, 100 a page. The
+        query carries no branch (SIGN_HOLD_SOURCES filters those itself), so every branch's run of that workflow is
+        listed, each with its head_branch."""
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         status, page = query.get("status", [None])[0], int(query.get("page", ["1"])[0])
-        chosen = [r for r in sorted(runs, key=lambda r: -r[0]) if status is None or r[1] == status]
+        workflow = url.split("/actions/workflows/", 1)[1].split("/", 1)[0]
+        rows = [cls._run_row(r) for r in runs]
+        chosen = [r for r in sorted(rows, key=lambda r: -r[0])
+                  if r[3] == workflow and (status is None or r[1] == status)]
         size = cr.SIGN_HOLD_PAGE_SIZE
-        return json.dumps({"workflow_runs": [{"id": i, "status": st, "head_sha": sha}
-                                             for i, st, sha in chosen[(page - 1) * size:page * size]]})
 
-    def github(self, runs: list[tuple[int, str, str]], lists: dict[str, str] | None, fail: str = "",
+        def row(i, st, sha, branch):
+            # cls.ABSENT_BRANCH leaves head_branch out altogether, as GitHub may; anything else goes through as given,
+            # None included (the schema types it nullable).
+            got = {"id": i, "status": st, "head_sha": sha}
+            return got if branch is cls.ABSENT_BRANCH else {**got, "head_branch": branch}
+
+        return json.dumps({"workflow_runs": [row(i, st, sha, branch)
+                                             for i, st, sha, _, branch in chosen[(page - 1) * size:page * size]]})
+
+    def github(self, runs: list[tuple], lists: dict[str, str] | None, fail: str = "",
                controller: str = "follows"):
-        """A fake anonymous GitHub and build controller: runs [(id, status, head sha)], lists {sha:
-        glaeda-signing-hooks.txt}; a url containing fail answers None. The controller answers a run's status from runs
-        ("follows"), or nothing ("down"). Returns the reads it was asked for."""
+        """A fake anonymous GitHub and build controller: runs [(id, status, head sha)] (nightly.yml on nightly-next)
+        or [(id, status, head sha, workflow, branch)], lists {sha: glaeda-signing-hooks.txt}; a url containing fail
+        answers None. The controller answers a run's status from runs ("follows"), or nothing ("down"). Returns the
+        reads it was asked for."""
         reads: list[str] = []
 
         def fetch(url: str, **_kw) -> str | None:
@@ -11051,7 +11554,7 @@ class RunnerTest(unittest.TestCase):
                     return None
                 return json.dumps({"known": True, "terminal": match[0][1] not in cr.SIGN_HOLD_ACTIVE,
                                    "run": {"id": rid, "status": match[0][1], "head_sha": match[0][2]}})
-            if "/actions/workflows/nightly.yml/runs" in url:
+            if "/actions/workflows/" in url and "/runs?" in url:
                 return self.runs_page(url, runs)
             sha = url.split("/")[-4]
             return (lists or {}).get(sha)
@@ -11079,14 +11582,141 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("41982716550", done["note"])
         self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
         self.assertFalse(any(hooks.glob("*" + cr.NEXT_SUFFIX)) or (hooks / cr.NEXT_RECORD).exists(), "nothing staged")
-        statuses = len(cr.SIGN_HOLD_ACTIVE)
+        statuses = len(cr.SIGN_HOLD_ACTIVE) * len(cr.SIGN_HOLD_SOURCES)
         self.assertEqual(len(reads), statuses + 2,
-                         "a runs list per active status, one list read per active head commit, none for a finished run")
+                         "a runs list per active status per source, one list read per active head commit, none for a "
+                         "finished run")
         # the next refresh (past the memo) rechecks the known blocker through the controller: no anonymous read
         cr._SIGN_HOLD_MEMO.clear()
         reads.clear()
         self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
         self.assertEqual(reads, [f"{cr.SIGN_HOLD_CONTROLLER_DEFAULT}/v1/github/runs/41976650433?wait=0"])
+
+    def test_sign_hold_covers_every_workflow_whose_signing_jobs_this_runner_admits(self) -> None:
+        # ONE_MINI_NIGHTLY, AUTO_RESUME: this runner admits main's nightly.yml signing jobs and main's
+        # auto-resume-nightly-notarization.yml ones, so a run of either holds a hook its commit does not list. With
+        # nightly-next alone, cmux main's list (several releases behind nightly-next's) would have refused every
+        # classic signing job instead.
+        self.assertEqual(dict(cr.SIGN_HOLD_SOURCES),
+                         {"nightly.yml": frozenset({"nightly-next", "main"}),
+                          "auto-resume-nightly-notarization.yml": frozenset({"main"})})
+        lists = {self.OLD_SHA: f"{self.older_digest()} glaeda old\n",
+                 self.NEW_SHA: f"{self.older_digest()} old\n{self.new_digest()} new\n"}
+        for name, run in (("main's classic nightly", (41990000001, "queued", self.OLD_SHA, "nightly.yml", "main")),
+                          ("main's auto-resume", (41990000002, "in_progress", self.OLD_SHA,
+                                                  "auto-resume-nightly-notarization.yml", "main"))):
+            with self.subTest(holds=name):
+                hooks = self.signing_install()
+                self.github([run], lists)
+                done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+                self.assertEqual(done["state"], "deferred")
+                self.assertIn(f"run {run[0]} at aaaaaaaaaaaa", done["note"])
+                self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+        # a branch no entry names, and a workflow no entry names, hold nothing
+        for name, run in (("rc/1.2's nightly", (41990000003, "queued", self.OLD_SHA, "nightly.yml", "rc/1.2")),
+                          ("a feature branch's nightly", (41990000004, "queued", self.OLD_SHA, "nightly.yml",
+                                                          "feat-x")),
+                          ("nightly-next's auto-resume", (41990000005, "queued", self.OLD_SHA,
+                                                          "auto-resume-nightly-notarization.yml", "nightly-next"))):
+            with self.subTest(holds_nothing=name):
+                hooks = self.signing_install()
+                self.github([run], lists)
+                self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "updated")
+                self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+
+    def test_sign_hold_ignores_a_run_whose_commit_lists_neither_hook(self) -> None:
+        # A commit that lists neither the installed hook nor the new one refuses this runner's sign job whichever hook
+        # it holds, so holding the old one serves that run nothing and must not strand the rollout. cmux main's list
+        # trailed nightly-next's by seven hooks on 2026-11-05 and every queued main run's commit was in exactly this
+        # state, so with main a source a digest-keyed 3 h hold would have restarted on every glaeda merge.
+        other = "c" * 40
+        hooks = self.signing_install()
+        reads = self.github([(41990000006, "queued", other, "nightly.yml", "main")],
+                            {other: f"{'9' * 64} glaeda someone else's hook\n"})
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "updated", "a run the old hook cannot serve either does not hold")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+        self.assertIn(cr.SIGN_HOLD_LIST_URL.format(repo=cr.SIGN_HOLD_REPO, sha=other), reads,
+                      "the decision is read, not assumed")
+        # a run whose commit does list the installed hook holds: the gate is what the installed hook can serve, not
+        # which branch or workflow the run came from. A different commit, since a commit's list never changes and the
+        # answer above is cached against it.
+        served = "d" * 40
+        cr._SIGN_HOLD_MEMO.clear()
+        hooks = self.signing_install()
+        self.github([(41990000008, "queued", served, "nightly.yml", "main")],
+                    {served: f"{'9' * 64} other\n{self.older_digest()} glaeda installed\n"})
+        self.assertEqual(self.invoke("--refresh-hooks", "--apply")["runners"][0]["state"], "deferred")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+
+    MID_HOOK = HOOK.read_text() + "\n# a hook installed between the two refreshes\n"
+
+    def mid_digest(self) -> str:
+        return hashlib.sha256(self.MID_HOOK.encode()).hexdigest()
+
+    def test_sign_hold_cap_still_fires_when_two_instances_sit_at_different_hooks(self) -> None:
+        """One state file serves every instance, so an instance at another hook must not reset the cap window.
+
+        refresh_hooks calls sign_hold once per receipt (the install's own and every instance-*), against one
+        sign-hold.json. The cached decisions are per (rolled-out, installed) pair, but the cap window is not: if a
+        change of the installed hook reset "since" too, two instances sitting at different hooks would reset it for
+        each other about six times an hour and the 3 h cap would never fire, so a blocked run could hold a rollout
+        for good. Keyed this way the window belongs to the hook being rolled out and ages normally.
+        """
+        home, digest = self.home, "d" * 64
+        h0, h1 = "0" * 64, "1" * 64
+        clock = [1000.0]
+        self.github([(7, "queued", self.OLD_SHA)], {self.OLD_SHA: f"{h0} old\n{h1} other\n"})
+        notes = []
+        # the two instances alternate for well past the cap, as every refresh would
+        for i in range(12):
+            for installed in (h1, h0):
+                notes.append(cr.sign_hold(home, digest, installed, now=lambda: clock[0]))
+                cr._SIGN_HOLD_MEMO.clear()  # a later refresh, not this one's memo
+            clock[0] += cr.SIGN_HOLD_CAP_S / 6
+        self.assertTrue(any(n is None for n in notes),
+                        "the cap must fire for one of the pairs once the window has aged past it; "
+                        f"every call deferred instead ({len(notes)} calls over "
+                        f"{(clock[0] - 1000.0) / 3600:g} h)")
+        held = json.loads((home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE).read_text())
+        self.assertEqual(held["digest"], digest)
+        self.assertLessEqual(held["since"], 1000.0, "the window is the rolled-out hook's, so it is never restarted")
+
+    def test_sign_hold_decides_again_once_a_different_hook_is_on_disk(self) -> None:
+        # A cached decision folds in the installed hook, so it belongs to that hook and not merely to the digest being
+        # rolled out. A run whose commit lists only the hook that lands on disk between two refreshes needs the hold
+        # the second time though it needed none the first, so a decision keyed on the incoming digest alone installs
+        # over its sign job. The memo is keyed on both for the same reason.
+        mid, sha = self.mid_digest(), "e" * 40
+        hooks = self.signing_install()
+        self.hook_history(self.OLDER_HOOK, self.MID_HOOK)
+        self.github([(41990000009, "queued", sha, "nightly.yml", "nightly-next")],
+                    {sha: f"{mid} glaeda the hook that lands next\n"})
+        # the hook on disk is the older one, which that commit does not list: holding it serves the run nothing
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "updated", "a run the installed hook cannot serve does not hold")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+        # that same run is still active, and now the hook it does list is the one on disk (an --apply from a newer
+        # copy, or a relabel; the rollout keeps such a hook). The decision is the opposite one.
+        (hooks / cr.HOOK_NAME).write_text(self.MID_HOOK)
+        done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(done["state"], "deferred",
+                         "the cached decision belonged to the hook that was on disk when it was taken")
+        self.assertIn(f"run 41990000009 at {sha[:12]}", done["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.MID_HOOK, "its sign job keeps the hook it lists")
+
+    def test_sign_hold_holds_when_a_run_does_not_say_which_branch_it_is_on(self) -> None:
+        # head_branch is nullable in GitHub's schema. Which branch a run is on decides whether it holds, so an answer
+        # without it is an unreadable answer (hold), never "some branch no entry names" (install).
+        for name, branch in (("absent", self.ABSENT_BRANCH), ("null", None), ("wrong type", 7)):
+            with self.subTest(head_branch=name):
+                hooks = self.signing_install()
+                row = (41990000007, "queued", self.OLD_SHA, "nightly.yml", branch)
+                self.github([row], {self.OLD_SHA: f"{self.older_digest()} glaeda old\n"})
+                done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+                self.assertEqual(done["state"], "deferred")
+                self.assertIn("could not read the active runs", done["note"])
+                self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
 
     def test_sign_hold_installs_once_every_active_run_lists_the_new_hook(self) -> None:
         hooks = self.signing_install()
@@ -11152,7 +11782,9 @@ class RunnerTest(unittest.TestCase):
         done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
         self.assertEqual(done["state"], "deferred")
         self.assertIn("run 7 at aaaaaaaaaaaa", done["note"])
-        self.assertEqual(sum("status=queued" in u for u in reads), 2)
+        # two pages of nightly.yml's queued runs, and one of every other source's (none of which came back full)
+        self.assertEqual(sum("status=queued" in u and "/nightly.yml/" in u for u in reads), 2)
+        self.assertEqual(sum("status=queued" in u for u in reads), len(cr.SIGN_HOLD_SOURCES) + 1)
         # more pages of one status than it reads is no answer, which holds like a failed read
         cr._SIGN_HOLD_MEMO.clear()
         self.github([(5000 + i, "queued", self.NEW_SHA) for i in range(cr.SIGN_HOLD_PAGE_SIZE * cr.SIGN_HOLD_PAGES)],

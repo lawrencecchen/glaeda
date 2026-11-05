@@ -118,6 +118,79 @@ class RefusalTest(unittest.TestCase):
                 self.assertIsNotNone(why)
                 self.assertIn("signing job", why)
 
+    def test_classic_auto_resume_key_free_jobs_are_admitted(self):
+        # ONE_MINI_NIGHTLY, AUTO_RESUME: main's auto-resume-nightly-notarization.yml after main's nightly.yml run on
+        # main (workflow_run), or its dispatch from main: the two jobs that hold no key (preflight, verify-stapled)
+        # run here, light; its key-holding jobs keep the trusted signing runner, and the rest is refused
+        source = {"path": ".github/workflows/nightly.yml", "head_branch": "main", "event": "schedule",
+                  "pull_requests": [], "head_repository": {"full_name": REPO}, "repository": {"full_name": REPO}}
+        repository = {"full_name": REPO, "default_branch": "main"}
+
+        def resume(name, event_name="workflow_run", **changes):
+            case = job(name, workflow="auto-resume-nightly-notarization.yml", ref="refs/heads/main",
+                       event_name=event_name)
+            if event_name == "workflow_run":
+                case["event"] = {"action": "completed", "repository": repository,
+                                 "workflow_run": {**source, **changes}}
+            else:
+                case["event"] = {"ref": "refs/heads/main", "repository": repository, "inputs": {}}
+            return case
+        for name in ("preflight", "verify-stapled"):
+            for event_name in ("workflow_run", "workflow_dispatch"):
+                with self.subTest(job=name, event_name=event_name):
+                    self.assertIsNone(self.why(**resume(name, event_name)))
+            self.assertEqual(hook.job_class(name, REPO, hook.DEFAULT_HOME_REPO,
+                                            "auto-resume-nightly-notarization.yml")[0], "light")
+        for name in hook.AUTO_RESUME_SIGNING_JOBS:
+            with self.subTest(signing=name):
+                self.assertIn("signing job", self.why(**resume(name)))
+        for name in ("staple-outer", "staple-stapled", "publish"):
+            with self.subTest(signing_now=name):
+                self.assertIn("signing job", self.why(**resume(name)))
+        # AUTO_RESUME_HOSTED_JOBS keep their hosted route: no glaeda runner admits them, this one included. The
+        # refusal now comes from the tier, not the job list: job_tier gives them no tier at all (an Apple-queue wait
+        # must not outrank a PR job on a general pool runner either), and a nightly-only runner takes nightly work
+        # only, so they are refused one step earlier than the other non-key-free jobs.
+        for name in hook.AUTO_RESUME_HOSTED_JOBS:
+            with self.subTest(poll=name):
+                why = self.why(**resume(name))
+                self.assertIsNotNone(why)
+                self.assertIn("this job is not nightly work", why)
+                self.assertEqual(hook.job_tier("workflow_run", hook.AUTO_RESUME_REF, REPO,
+                                               resume(name)["event"], resume(name)["workflow_ref"], name), "")
+        for name in ("decide",):
+            with self.subTest(other=name):
+                self.assertIsNotNone(self.why(**resume(name)))
+        for changes in ({"head_branch": "nightly-next"}, {"head_branch": "feat-x"},
+                        {"path": ".github/workflows/ci.yml"}, {"event": "pull_request"},
+                        {"head_repository": {"full_name": "someone/cmux"}}):
+            with self.subTest(source=changes):
+                self.assertIsNotNone(self.why(**resume("preflight", **changes)))
+        # AUTO_RESUME fails closed here too: a malformed triggering run refuses, and pull_requests, which the
+        # hook deliberately does not read, neither admits nor refuses one on its own
+        for field in ("path", "head_branch", "event", "head_repository", "repository"):
+            for shape in (None, {}, "", [], 1):
+                with self.subTest(field=field, shape=shape):
+                    self.assertIsNotNone(self.why(**resume("preflight", **{field: shape})))
+        for name, event in (("workflow_run null", {"action": "completed", "repository": repository,
+                                                   "workflow_run": None}),
+                            ("workflow_run empty", {"action": "completed", "repository": repository,
+                                                    "workflow_run": {}}),
+                            ("payload null", None), ("payload a string", "x")):
+            case = resume("preflight")
+            case["event"] = event
+            with self.subTest(payload=name):
+                self.assertIsNotNone(self.why(**case))
+        for pulls in (None, [], {}, "many", [None], [{}], [{"number": 1}], [{"head": {}, "base": {}}], 42):
+            with self.subTest(pull_requests=pulls):
+                self.assertIsNone(self.why(**resume("preflight", pull_requests=pulls)))
+                self.assertIsNotNone(self.why(**resume("preflight", pull_requests=pulls,
+                                                       head_branch="nightly-next")))
+        other_branch = resume("preflight")
+        other_branch["workflow_ref"] = (f"{REPO}/.github/workflows/auto-resume-nightly-notarization.yml"
+                                        "@refs/heads/feat-x")
+        self.assertIsNotNone(self.why(**other_branch))
+
     def test_cli_admits_and_refuses_from_the_job_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
             def run(case):

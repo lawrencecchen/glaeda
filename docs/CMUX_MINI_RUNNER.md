@@ -950,6 +950,92 @@ there while it waits, and waits `SIGNING_DRAIN_WAIT_S` at most, like a nightly-s
 declare `yieldToExclusive` (section 2e1) so they start nothing while it waits or signs. The hook's bytes change, so
 cmux's `scripts/ci/glaeda-signing-hooks.txt` must list the new sha256 at nightly-next before the OTA.
 
+ONE_MINI_NIGHTLY (Lawrence, 2026-11-05: every classic and nightly-next nightly job on one Mac mini, cmux15, with no
+Blacksmith) widens that runner, and only that runner, in three exact ways:
+
+- a `workflow_dispatch` of the exact `nightly.yml@refs/heads/nightly-next` is admitted for its `SIGNING_JOBS` like
+  its push (payload ref, repository and hostile-payload checks still apply), since cmux's one-mini mode routes a
+  dispatched run's signing jobs here too;
+- main's classic `nightly.yml` signing and publishing jobs (`CLASSIC_SIGNING_JOBS`: `build-sign-notarize-nightly`,
+  `verify-signed-nightly`, `publish-nightly`, `generate-nightly-deltas`, `republish-nightly-deltas`, and main's
+  nightly-next promotion jobs `promote-nightly-next`, `promote-nightly-next-acked`, `await-release-surface-ack`) are
+  admitted on a `workflow_dispatch` of the exact `nightly.yml@refs/heads/main` (main's push and schedule jobs were
+  already admitted). `verify-signed-nightly` and `await-release-surface-ack` hold no key and are light; the others are
+  exclusive. Every other dispatch, workflow, ref, fork and pull request stays refused, and a trusted runner without
+  `--trusted-next-signing` still refuses every dispatch;
+- nightly-next's short key-holding jobs (`promote-nightly-next-acked`, `keep-published-dsyms`,
+  `sentry-dsyms-nightly`, `sign-release-notes`, `publish-release-notes`, `publish-nightly-reel`,
+  `publish-nightly-identity-legacy`, `republish-nightly-deltas`, `legacy-identity-target`) are `SIGNING_JOBS`: the
+  exclusive class, so each one drains the mini once.
+
+AUTO_RESUME (the same goal) admits main's `auto-resume-nightly-notarization.yml`, the classic continuation of a nightly
+whose Apple notarization outlived the run, on its `workflow_run` and its `workflow_dispatch`. Both must be main's own
+copy (`GITHUB_WORKFLOW_REF` `...@refs/heads/main`, `GITHUB_REF` main, a dispatch payload ref of main); a
+`workflow_run` must name exactly `manaflow-ai/cmux`'s `.github/workflows/nightly.yml` run on `main` (head and base
+repository `manaflow-ai/cmux`, source event push, schedule or dispatch, no pull request), with action `completed` and
+main as the default branch (`auto_resume_refusal`). Every job of that workflow checks out `refs/heads/main` and reads
+only the source run's artifacts, which `preflight` checks through the API first. The jobs that do the nightly's
+work rank as nightly (`job_tier`); its three Apple-queue poll jobs rank no tier and are refused on every runner
+class (below).
+
+- On a `--trusted-next-signing` runner, and only there, the jobs that hold a release key (Apple certificate,
+  notary API key, Sparkle key, R2 key or the release app key) *and* do work with it: `AUTO_RESUME_SIGNING_JOBS`,
+  which `trusted_refusal` admits and nothing else. Holding a key is not the test; what the job does with it is.
+  - `wait-and-staple`, `staple-outer`, `staple-stapled`, `publish`, `generate-deltas`, `republish-deltas`
+    (`AUTO_RESUME_SIGNING_JOBS`): they staple, sign or publish, so each is a `SIGNING_JOBS` entry, exclusive
+    class, one drain of the mini.
+- `poll`, `poll-outer` and `poll-stapled` (`AUTO_RESUME_HOSTED_JOBS`) keep their hosted route in cmux, and no
+  glaeda runner class takes one. `hosted_route_refusal` refuses them on the common path, before any class check,
+  so the general pool is covered too, not only the classes that check trust (`trusted_refusal` on a
+  `--trusted-next-signing` runner, `glaeda-nightly-only-admit` on a nightly-only one, both of which also refuse
+  them). `job_tier` gives them no tier, so they cannot outrank a PR job, and their `light` class keeps the cost
+  at 2 units and no root. Belt and braces on purpose: cmux routes all three to ubuntu today, and if that ever
+  changed by accident the job is refused and requeued rather than parking a runner for hours.
+  They hold the notary key, but each only asks Apple whether a submission is done, so its timeout is Apple's
+  queue rather than work: 90, 360 and 360 minutes. No class puts them on the one nightly runner without stopping
+  the nightly.
+  - Exclusive, the claim holds the whole mini for that long. The exclusive class bounds how long a job *waits*
+    for the mini (`SIGNING_DRAIN_WAIT_S`), never how long it then holds it, and every `yieldToExclusive`
+    dedicated runner there starts nothing while a claim is held (`YIELD_TO_EXCLUSIVE`, bound 3 h, then it
+    refuses its own job), so the nightly, classic and NEXT, stops.
+  - Light, the claim is gone but the job's processes are not: an exclusive job needs no process of another job
+    in any runner's `_work` before it may hold the mini (`stray_job_processes`), so a 6 hour poll means every
+    nightly signing job behind it waits `SIGNING_DRAIN_WAIT_S` and is then refused so the run's Blacksmith job
+    signs.
+
+  Either way the mini sends signing to Blacksmith for hours, which is what the one-mini nightly exists to end,
+  and the 30 minute feed freshness bound cannot hold. cmux's workflow put these three on ubuntu for this reason
+  ("Apple queue latency never reserves signing workers"). Taking them off Blacksmith too needs the waiting split
+  from the acting on the cmux side, so the mini is claimed for the stapling and not for Apple's queue. cmux
+  gives the claim gate to the exclusive six, not to these three.
+
+  The same reasoning is only partly discharged for the six. `wait-and-staple` (job timeout 180 min, an inner
+  `notarytool` wait of 150) and `staple-outer` (150, inner 120) are exclusive and also wait on Apple inside the
+  job, so one can hold the mini for hours, against `YIELD_TO_EXCLUSIVE_WAIT_S`'s 3 h. They stay exclusive
+  because they do staple with a key, and the fix is the same cmux-side split; until it lands, a classic
+  notarization that outlives its run is a multi-hour stall mode for the one-mini nightly. `publish` and
+  `republish-deltas` are exclusive too and cmux runs them on ubuntu today, so like the three above they only
+  reach this runner once cmux reroutes them, and `publish` has no `timeout-minutes` at all (GitHub's 360
+  default), which it needs before it is routed here.
+
+- A run's `pull_requests` is deliberately not read. It is every pull request whose head is that run's commit, in
+  any repository, so a push run on main lists each fork's open main-to-main sync pull request (cmux's
+  `nightly.yml` run 37603581609 listed four) and a contributor's open pull request into our main lists too.
+  Reading it as "this was a pull request run" refuses every real run, and narrowing it is not sound either: an
+  entry's url names its base repository, so our own main is the base of a contributor's, while `head.repo` is
+  ours for a fork's sync one (`PullRequestMinimal` carries `id`, `name` and `url` per side, never `full_name`).
+  It would buy nothing: the run's `event` is already `push`, `schedule` or `workflow_dispatch`, which excludes a
+  pull_request run, and its `head_branch`, both repositories and this payload's own `pull_request` and
+  `merge_group` keys are checked.
+- On the nightly-only runners (`glaeda-nightly-only-admit`): `preflight` and `verify-stapled`
+  (`AUTO_RESUME_LIGHT_JOBS`), light; they hold no key.
+- The ubuntu jobs run on a mini's `/bin/bash` 3.2: `poll-outer`, `poll-stapled` and `publish` since cmux #36561
+  (main `7badd980`).
+
+A `workflow_run` from nightly-next, `rc/**`, a feature branch, a pull request or another repository, and a dispatch
+of another branch's copy, stay refused, and a trusted runner without `--trusted-next-signing` still refuses every
+`workflow_run` and dispatch.
+
 What the gate cannot see, and the operator must keep true:
 
 - The trust boundary is whoever can push to main: main's ruleset must block direct pushes, with no

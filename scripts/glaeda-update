@@ -188,7 +188,14 @@ RATE_WAIT_MAX = 5 * 60  # a spent quota that resets this soon is waited for; a l
 # A failure is waited out to the reset (at most an hour): unposted, another canary's success would
 # promote the release after the 15-minute soak, before the next run could post it.
 FAILURE_WAIT_MAX = 60 * 60
-RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit", "http 429")
+# Our own gh is the broker chain (the gh-quota shim, the local-build guard, glaeda's broker), and the shim refuses a
+# call in its own words when a shared pool is under its low-water floor. That refusal is a spent quota, not a verdict:
+# read as one, `gh attestation verify`'s non-zero exit looked like a failed verification, so a canary quarantined a
+# good release for good and posted a canary failure that holds stable for the whole fleet (a canary host, 2026-11-07,
+# r-20261107-ac67c27f2d27: "refused: build-provenance attestation did not verify: gh-quota: refused").
+RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit", "http 429",
+                "gh-quota: refused")
+BROKER_MARKER = "gh-quota: "  # any word from the shim, whatever it adds later: it answered, GitHub did not
 TRANSIENT_MARKERS = ("http 500", "http 502", "http 503", "http 504", "timeout", "timed out", "connection",
                      "network", "temporarily unavailable", "eof")
 MAX_UNREPORTED = 5
@@ -381,6 +388,12 @@ def gh_kind(text: str) -> str | None:
     return None
 
 
+def gh_output(result: "subprocess.CompletedProcess[str]") -> str:
+    """Both of gh's streams. gh writes its own errors to stderr, but the quota shim in front of it may
+    answer on either, and one stream holding a warning must not hide the other's refusal."""
+    return "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+
+
 def gh_call(gh: str, args: list[str], timeout: int,
             max_wait: float = RATE_WAIT_MAX) -> tuple[subprocess.CompletedProcess | None, str]:
     """Run gh, riding out a spent quota or a transient error: (result, "") when it ran to a verdict,
@@ -404,7 +417,7 @@ def gh_call(gh: str, args: list[str], timeout: int,
             continue
         except OSError as e:
             return None, f"transient: {type(e).__name__}: {e}"
-        message = (result.stderr or result.stdout).strip()
+        message = gh_output(result)
         kind = gh_kind(message) if result.returncode != 0 else None
         if kind is None:
             return result, ""
@@ -429,12 +442,17 @@ def attestation(path: Path) -> tuple[bool | None, str]:
                                "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"], 120)
     if result is None:
         return None, why
+    full = gh_output(result).lower()  # classify the whole output; only the diagnostic below is truncated
+    message = gh_output(result)[:200]
     if result.returncode == 0:
-        return True, "verified"
-    message = (result.stderr or result.stdout).strip()[:200]
-    if any(marker in message.lower() for marker in ("http 401", "http 403", "permission denied")):
+        return True, "verified"  # gh ran and verified it: only its own zero exit says that
+    if BROKER_MARKER in full:
+        # our own shim refused or answered instead of GitHub (a spent pool, a guard): nothing was verified either
+        # way, and a refusal must never read as a failed verification
+        return None, f"gh did not reach GitHub: {message}"
+    if any(marker in full for marker in ("http 401", "http 403", "permission denied")):
         return None, f"gh cannot read attestations: {message}"
-    if 'unknown command "attestation"' in message or message.startswith("unknown flag"):
+    if 'unknown command "attestation"' in full or full.startswith("unknown flag"):
         # an older gh (Ubuntu 24.04's apt gh is 2.45, before `gh attestation`; or one before a flag above): it
         # cannot ask, which is not a failed verification. gh says so while parsing argv, before reading the archive.
         return None, f"gh is too old to verify attestations: {message.splitlines()[0]}"

@@ -9169,10 +9169,22 @@ def disk_argv(explicit: str | None, floor_gib: float = 0.0) -> list[str] | None:
     return [sys.executable, disk, "--pressure", "--apply", "--top", "0", *floor]
 
 
-def floor_disk_env(caller: str) -> dict[str, str]:
+def floor_disk_env(caller: str, timeout: float | None = None) -> dict[str, str]:
     """A floor eviction's environment: it must free space now, so glaeda-disk never folds it into the queued pass
-    (GLAEDA_DISK_HOOK_PASS, as the queue's own pass), and its run line names the caller."""
-    return {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
+    (GLAEDA_DISK_HOOK_PASS, as the queue's own pass), and its run line names the caller.
+
+    A caller that bounds the run gives the child the time half of that bound runs out at, as the longest it may wait
+    for another eviction (GLAEDA_DISK_FLOOR_WAIT_UNTIL, glaeda-disk's floor_evict_wait_until), so a 30 s gate never
+    leaves its child waiting past the kill and the other half is still there to evict with. The cutoff is absolute
+    because the caller's timeout starts here, at launch, while the child reaches its wait later: a duration would
+    have let a slow start push the wait past the kill, with no `expired` line to read. It is deliberately not
+    HYGIENE_RUN_DEADLINE: that one bounds every walk and verdict too, and its fixed margin would stop an ordinary
+    pass of this length from reclaiming anything at all.
+    """
+    env = {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
+    if timeout is not None and math.isfinite(timeout) and timeout > 0:
+        env["GLAEDA_DISK_FLOOR_WAIT_UNTIL"] = repr(time.time() + timeout / 2)
+    return env
 
 
 # glaeda-disk's answers when it ran no pass because another holds evict.lock or measure.lock (DISK_BOUND's BUSY)
@@ -9193,7 +9205,7 @@ def disk_pressure_run(explicit: str | None, floor_gib: float = 0.0,
         result = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=timeout, check=False, env=floor_disk_env("runner hook floor eviction"),
+            timeout=timeout, check=False, env=floor_disk_env("runner hook floor eviction", timeout),
         )
         out = result.stdout if isinstance(result.stdout, bytes) else b""
         skipped = any(mark in out for mark in DISK_BUSY)

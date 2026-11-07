@@ -4709,8 +4709,9 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
                 mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
                 mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
-                mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(out := io.StringIO()):
             status = gd.main(argv + ["--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
+        self.said = out.getvalue()  # what the run printed, for a test that checks its wording
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         return status, rows, survey, apply
 
@@ -5164,6 +5165,130 @@ class GlaedaDiskTest(unittest.TestCase):
                          (os.getpid(), "glaeda-disk --pressure --apply --top 0"))
         self.assertIsNotNone(row["evict_owner"]["since"])
         cap.assert_not_called()
+        survey.assert_not_called()
+
+    def test_a_floor_run_waits_for_the_running_eviction_and_then_takes_its_turn(self) -> None:
+        """A mini at 47.8 GiB free against a 50 GiB floor skipped every out-of-band run as eviction_busy while the
+        holder evicted families the floor did not need (glaeda#1897 F2). A run the floor needs waits for its turn."""
+        _, _, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "eviction_lock_is_held", side_effect=[True, True, False]) as held, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual(row["skipped"], None, "it waited for the lock and ran; it did not skip")
+        self.assertEqual(row["evict_floor_wait"], "took its turn")
+        self.assertGreater(held.call_count, 1, "it probed again instead of giving up on the first answer")
+        survey.assert_called()
+
+    def test_the_floor_wait_refuses_a_lock_that_came_free_after_the_deadline(self) -> None:
+        """The deadline bounds the whole run, not just the wait: a holder that releases a moment too late does not
+        buy this run a cap measurement and an eviction past it (router-review F1 on glaeda#1902)."""
+        with mock.patch.object(gd, "eviction_lock_is_held", return_value=False):
+            self.assertFalse(gd.wait_for_evict_lock(time.monotonic() - 0.01),
+                             "free, but only after the deadline")
+            self.assertTrue(gd.wait_for_evict_lock(time.monotonic() + 5.0))
+
+    def test_the_floor_wait_is_bounded_by_what_its_caller_allows(self) -> None:
+        """The gate gives half its timeout as the wait (floor_disk_env), so a short gate never leaves its child
+        waiting past the kill, and the run deadline still bounds it when one is set (router-review F2 on #1902)."""
+        self.addCleanup(setattr, gd, "FLOOR_HOLD", gd.FLOOR_HOLD)
+        gd.FLOOR_HOLD = {1: 1}
+        for env, why in (
+                ({gd.FLOOR_WAIT_ENV: repr(time.time())}, "a caller with no room to wait"),
+                ({gd.FLOOR_WAIT_ENV: repr(time.time() - 5.0)}, "a caller already out of time"),
+                ({gd.RUN_DEADLINE_ENV: repr(time.time() + 30.0)}, "less time left than the deadline margin"),
+        ):
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(gd.floor_evict_wait_until(True), 0.0, why)
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: repr(time.time() + 10.0)}):
+            left = gd.floor_evict_wait_until(True) - time.monotonic()
+            self.assertTrue(0 < left <= 10.0, f"its caller's 10 s, not {gd.EVICT_WAIT_FLOOR_S:g}: {left}")
+        # the caller's timeout starts at its launch, so a slow start eats the wait instead of pushing it past the kill
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: repr(time.time() + 15.0)}), \
+                mock.patch.object(gd.time, "time", return_value=time.time() + 20.0):
+            self.assertEqual(gd.floor_evict_wait_until(True), 0.0, "20 s of start-up spent the 15 s cutoff")
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: "not a number"}):
+            left = gd.floor_evict_wait_until(True) - time.monotonic()
+            self.assertTrue(0 < left <= gd.EVICT_WAIT_FLOOR_S, f"unreadable: the plain budget, not none: {left}")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for name in (gd.FLOOR_WAIT_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            self.assertGreater(gd.floor_evict_wait_until(True), time.monotonic(), "unbounded caller: the full budget")
+
+    def test_a_wait_at_the_acquisition_measures_the_cap_again(self) -> None:
+        """The holder was evicting while this run waited, so a cap measured before it is spent: a waiter that kept
+        its old budget took young build output the holder had already freed (router-review F1 on glaeda#1902)."""
+        _, _, p_lock, p_pending = self._queue()
+        cap = {"used": 3 * gd.GIB, "cap": 4 * gd.GIB, "over": 0, "at": time.time()}
+        taken = (self.root / "taken.lock").open("a")
+        self.addCleanup(taken.close)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "eviction_lock_is_held", return_value=False), \
+                mock.patch.object(gd, "acquire_evict_lock", side_effect=[None, taken]), \
+                mock.patch.object(gd, "release_evict_lock"), \
+                mock.patch.object(gd, "wait_for_evict_lock", return_value=True), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=cap) as measured:
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        self.assertEqual(rows[-1]["evict_floor_wait"], "took its turn")
+        self.assertEqual(measured.call_count, 2, "once before the wait, once after it")
+        self.assertEqual(rows[-1]["cmux_next_ci_over_gib"], 0.0, "the fresh reading, not the one from before")
+        self.assertTrue(all(call.kwargs.get("measure") for call in measured.call_args_list),
+                        "the second reading is a fresh measurement, not the stale snapshot")
+        survey.assert_called()
+
+    def test_a_cap_reading_that_fails_after_the_wait_takes_the_budget_with_it(self) -> None:
+        """A du that failed or timed out gives None: reading `over` from it raised, and keeping the stale budget
+        would delete output the holder already freed (router-review F2 on glaeda#1902)."""
+        _, _, p_lock, p_pending = self._queue()
+        first = {"used": 6 * gd.GIB, "cap": 4 * gd.GIB, "over": 2 * gd.GIB, "at": time.time()}
+        taken = (self.root / "taken.lock").open("a")
+        self.addCleanup(taken.close)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "eviction_lock_is_held", return_value=False), \
+                mock.patch.object(gd, "acquire_evict_lock", side_effect=[None, taken]), \
+                mock.patch.object(gd, "release_evict_lock"), \
+                mock.patch.object(gd, "wait_for_evict_lock", return_value=True), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", side_effect=[first, None]):
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0, "the run goes on; an unreadable cap is not a crash")
+        self.assertEqual(rows[-1]["cmux_next_ci_over_gib"], None, "no budget from a reading it does not have")
+        self.assertEqual(gd.CMUX_NEXT_CI_OVER, 0)
+        survey.assert_called()
+
+    def test_a_floor_runs_wait_that_expires_says_the_holders_pass_serves_the_floor(self) -> None:
+        """The wait is bounded: it never blocks a floor run behind a long eviction, and the line says who serves."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "EVICT_WAIT_FLOOR_S", 0.05), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_floor_wait"]), ("eviction_busy", "expired"))
+        self.assertIn("its pass serves this floor", self.said)
+        survey.assert_not_called()
+
+    def test_a_run_above_the_floor_still_skips_a_held_lock_at_once(self) -> None:
+        """Manual and LaunchAgent runs above the floor keep today's behaviour: no wait, no sleep."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd.time, "sleep") as slept, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_floor_wait"]), ("eviction_busy", None))
+        self.assertNotIn("serves this floor", self.said)
+        slept.assert_not_called()
         survey.assert_not_called()
 
     def test_the_run_line_names_its_caller_without_the_variable(self) -> None:

@@ -266,6 +266,18 @@ COALESCED_INTO_HOOK = "coalesced into the running pass (glaeda-disk)"
 OUT_OF_BAND = "out of band"
 FLOOR_CALLER_MARK = "floor eviction"  # the hook's floor_disk_env callers: they must free space now, so never the queue
 CI_DEFER_MARK = "deferred: a CI job is running"  # the hook's bound reads this (DISK_BOUND's BUSY) to keep its trigger
+# A run the floor needs waits this long for evict.lock before it leaves the space to the holder's pass. The holder
+# picks its own families, so it need not free what this floor needs: measured on a mini at 47.8 GiB free against a
+# 50 GiB floor, where every out-of-band run skipped as eviction_busy while the holder evicted other families
+# (glaeda#1897 F2). Manual and LaunchAgent runs above the floor still skip at once.
+EVICT_WAIT_FLOOR_S = 120.0
+EVICT_WAIT_POLL_S = 2.0
+# When a caller that bounds the run says this run's wait for another eviction runs out (the hook's floor_disk_env,
+# half its own timeout, as a wall-clock time because its timeout started at launch and this run reaches its wait
+# later). The run deadline would do it, but that one bounds every walk and verdict too and would stop a short pass
+# from reclaiming anything.
+FLOOR_WAIT_ENV = "GLAEDA_DISK_FLOOR_WAIT_UNTIL"
+
 RUNNER_WORK_DIR = "_work"  # <runner>/_work: a job's workspace, its RUNNER_TEMP and its build output, all job-owned
 UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci")  # a run that skipped these did no pass
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
@@ -896,6 +908,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "7c0d9d8cae04254e76666b002b90f3d734a293bdcc0cee45175c01df67761bba",
     "79313d0b9048d3a3dd3f9483434f9bbf4e4e684fc68cac061ce80336f5acab54",
     "9118658689a903190cad26154ac9068d984f12543ae57aa1d4f90ff2ab67cce0",
+    "c3efaff090a931a4af225e06e8a2b904c4b87aacbfaa72f8dab01c099b1cb652",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -9615,6 +9628,48 @@ def _write_evict_owner() -> None:
     os.replace(tmp, EVICT_OWNER)
 
 
+def caller_floor_wait_s(now: float | None = None) -> float | None:
+    """Seconds left of what this run's caller allows it to wait for another eviction (FLOOR_WAIT_ENV, a wall-clock
+    cutoff), or None when it set none. Negative once that time has passed, so the wait is skipped."""
+    try:
+        until = float(os.environ.get(FLOOR_WAIT_ENV) or "")
+    except ValueError:
+        return None
+    if not math.isfinite(until):
+        return None
+    return until - (time.time() if now is None else now)
+
+
+def floor_evict_wait_until(apply_: bool) -> float:
+    """The monotonic time a run the floor needs may wait for evict.lock until, or 0.0 for no wait.
+
+    The floor itself is the trigger: FLOOR_HOLD holds a filesystem at or below its runner floor, and the hook's own
+    floor callers (FLOOR_CALLER_MARK) must free space now. Never past the caller's deadline (run_deadline_left).
+    """
+    if not apply_ or not (FLOOR_HOLD or FLOOR_CALLER_MARK in (os.environ.get(CALLER_ENV) or "")):
+        return 0.0
+    budget = EVICT_WAIT_FLOOR_S
+    for bound in (run_deadline_left(), caller_floor_wait_s()):
+        if bound is not None:
+            budget = min(budget, bound)
+    return time.monotonic() + budget if budget > 0 else 0.0
+
+
+def wait_for_evict_lock(until: float) -> bool:
+    """True once the lock looks free before `until`, False when that time passed with it still held.
+
+    It only probes: the holder's own release ends the wait, and the acquire after it still decides. A lock that
+    cannot be inspected (eviction_lock_is_held None) ends the wait too, so the acquire fails closed instead.
+    """
+    while eviction_lock_is_held():
+        left = until - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(EVICT_WAIT_POLL_S, left))
+    # a probe that saw it free after `until` is still too late: the deadline bounds the whole run, not just the wait
+    return time.monotonic() < until
+
+
 def acquire_evict_lock():
     """Acquire the eviction lock and publish an owner record for stale-lock recovery."""
     global _EVICT_HANDLE
@@ -11837,6 +11892,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     EMERGENCY_DEVS = frozenset() if sweep else emergency_devs(fss, a.emergency, floor_gib)
     FLOOR_HOLD = floor_hold(fss, floor_gib) if ACTIVITY_MODE == "pressure" else {}
     CMUX_NEXT_HOST_FLOOR = {dev: int(floor_gib * GIB) for dev in FLOOR_HOLD}
+    # read once, after FLOOR_HOLD: a run the floor needs waits for evict.lock instead of skipping at once
+    floor_evict_until = floor_evict_wait_until(a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE)
     busy = host_busy() if sweep else ""
     if sweep:
         print(f"idle sweep: {'host busy, ' + busy if busy else 'host idle'}")
@@ -11886,13 +11943,24 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 RUN["skipped"] = "defer_during_ci"
                 return 0
         if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE:
-            if eviction_lock_is_held():
+            held = eviction_lock_is_held()
+            if held and floor_evict_until and wait_for_evict_lock(floor_evict_until):
+                held = False
+                RUN["evict_floor_wait"] = "took its turn"
+                print(f"floor eviction: the running eviction finished within the floor's "
+                      f"{EVICT_WAIT_FLOOR_S:.0f}s wait; this run takes its turn")
+            elif held and floor_evict_until:
+                RUN["evict_floor_wait"] = "expired"
+            if held:
                 owner = eviction_owner_status()
                 RUN["evict_owner"] = owner
                 write_eviction_status(a.receipt, owner)
                 write_eviction_contention_health(a.receipt)
                 return deferred("eviction_busy", f"another eviction running; skipped before measuring "
-                                                 f"({eviction_owner_text(owner)})", owner=owner)
+                                                 f"({eviction_owner_text(owner)})"
+                                + (f"; the floor's {EVICT_WAIT_FLOOR_S:.0f}s wait ended with it still evicting, so "
+                                   "its pass serves this floor" if RUN.get("evict_floor_wait") == "expired" else ""),
+                                owner=owner)
     # only a pressure run measures the cap (one du) and acts on it (cmux_next_ci_over); a text report shows the last
     # measurement, and --json (glaeda-fleet-status asks every mini on every call) neither measures nor shows it
     global CMUX_NEXT_CI_OVER
@@ -11931,12 +11999,30 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # A second eviction would only race the first for the same items; its caller re-reads free
         # space instead.  The owner record lets a later run recover from a daemon that died while
         # its lock descriptor remained open.
-        if acquire_evict_lock() is None:
+        handle = acquire_evict_lock()
+        if handle is None and floor_evict_until and wait_for_evict_lock(floor_evict_until):
+            handle = acquire_evict_lock()  # one more turn: the holder released within the floor's wait
+            if handle is not None:
+                RUN["evict_floor_wait"] = "took its turn"
+                if cap is not None and pressure:
+                    # the holder was evicting while this run waited, so the cap measured before it is spent: a
+                    # waiter that kept its old budget would take young build output the holder had already freed
+                    cap = cmux_next_ci_cap_state(fams, a.cmux_next_cap_gib, measure=True)
+                    CMUX_NEXT_CI_OVER = cap["over"] if cap else 0  # a du that failed takes the budget, never the stale one
+                    RUN["cmux_next_ci_over_gib"] = round(cap["over"] / GIB, 1) if cap else None
+                    if cap and not a.json:
+                        print(f"cmux-next-ci: {gib(cap['used']).strip()} of its {cap['cap'] / GIB:g} GiB cap "
+                              f"({gib(cap['over']).strip()} over), measured again after the wait")
+        if handle is None:
+            if floor_evict_until:
+                RUN["evict_floor_wait"] = "expired"
             owner = eviction_owner_status()
             RUN["evict_owner"] = owner
             write_eviction_status(a.receipt, owner)
             write_eviction_contention_health(a.receipt)
-            result = deferred("eviction_busy", f"another eviction running; skipped ({eviction_owner_text(owner)})",
+            result = deferred("eviction_busy", f"another eviction running; skipped ({eviction_owner_text(owner)})"
+                              + (f"; the floor's {EVICT_WAIT_FLOOR_S:.0f}s wait ended with it still evicting, so its "
+                                 "pass serves this floor" if RUN.get("evict_floor_wait") == "expired" else ""),
                               owner=owner)
             if maintenance_handle is not None:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
@@ -12259,7 +12345,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "caller": RUN.get("caller"), "evict_owner": _owner_line(RUN.get("evict_owner")),
            "bundle_failed": RUN.get("bundle_failed", []),
            "bundle_failed_remembered": RUN.get("bundle_failed_remembered", []),
-           "out_of_band": RUN.get("out_of_band"),
+           "out_of_band": RUN.get("out_of_band"), "evict_floor_wait": RUN.get("evict_floor_wait"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
     with contextlib.suppress(OSError):

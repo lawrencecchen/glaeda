@@ -381,6 +381,19 @@ class FakeGitHub:
         return [c for c in self.rest_calls() if "/jobs" in c[1]]
 
 
+def assert_json_refusal(test: unittest.TestCase, stdout: str, code: str | None) -> None:
+    """stdout is exactly one agent-output-contract object (ok false, code, reason, next) and nothing else: no
+    usage text, notice or waiting line leaked into the document."""
+    doc = json.loads(stdout)
+    test.assertEqual(stdout.count("\n"), 1, stdout)
+    test.assertIs(doc["ok"], False)
+    test.assertTrue(doc["next"] and doc["reason"], doc)
+    if code is not None:
+        test.assertEqual(doc["code"], code)
+    test.assertNotIn("usage:", stdout)
+    test.assertNotIn("waiting on", stdout)
+
+
 class Base(unittest.TestCase):
     def setUp(self) -> None:
         # watch files carry real mtimes, so the fake clock starts at each test, not at import:
@@ -2005,7 +2018,8 @@ class BalanceTest(Base):
         self.daemon.tick(NOW + gg.TERMINAL_REFRESH + gg.CYCLE)
         missing = gg.read_cache("run:o/r/404")
         self.assertIn("no workflow run", missing["error"])
-        self.assertFalse(missing.get("missing"))  # as REST's 404: an error, not a verdict
+        # never shown by any read: missing (wait's not-found), as REST's 404 for such a run now is
+        self.assertTrue(missing.get("missing"))
 
     def test_prs_over_rest_when_graphql_is_poorer_read_the_same(self) -> None:
         checks = [workflow_check("build", 11), workflow_check("test", 11, conclusion="FAILURE"),
@@ -2962,6 +2976,101 @@ class ClientTest(Base):
         code, text = self.wait("pr", "o/r#404", fill=(None, {"error": "Could not resolve", "missing": True}))
         self.assertEqual(code, 1)
         self.assertIn("Could not resolve", text)
+        # the agent output contract: what is wrong, then `next:` last, on the stream the answer uses
+        lines = text.strip().splitlines()
+        self.assertEqual(lines[-1], "next: gh pr list -R o/r --state all --limit 5")
+        self.assertIn("no such PR or issue on GitHub", lines[-2])
+
+    def test_a_missing_pr_is_not_found_in_json(self) -> None:
+        self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
+        req = gg.wait_request("pr", "o/r#404", "green", 60, False, True, None, True, 0)
+        req["began"] -= 5
+        code, out = gg.wait_step(req, time.time())
+        doc = json.loads(out)
+        self.assertEqual(code, gg.EXIT_FAIL)
+        self.assertEqual((doc["ok"], doc["code"], doc["result"]), (False, "not-found", "failure"))
+        self.assertEqual(doc["next"], "gh pr list -R o/r --state all --limit 5")
+        run = gg.wait_request("run", "o/r/9", "green", 60, False, True, None, True, 0)
+        self.assertEqual(gg.not_found_fields(run["key"])["next"], "gh run list -R o/r --limit 5")
+
+    def test_a_timeout_names_its_deadline_and_the_wait_to_run_again(self) -> None:
+        running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
+        code, text = self.wait("pr", "o/r#1", fill=(running, {}), timeout=0.3)
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        lines = text.strip().splitlines()
+        self.assertEqual(lines[-1], "next: glaeda-gh wait pr o/r#1 --timeout 0.3")
+        self.assertRegex(lines[-2], r"^glaeda-gh: waited 0 s for o/r#1 \(deadline \d\d:\d\d:\d\dZ\); last seen: ")
+        self.assertIn("checks PENDING", lines[-2])
+
+    def test_a_wait_says_how_it_stands_while_it_blocks(self) -> None:
+        running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
+        with mock.patch.object(gg, "WAIT_PROGRESS_EVERY", 0.1):
+            code, text = self.wait("pr", "o/r#1", fill=(running, {}), timeout=0.5)
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        progress = [line for line in text.splitlines() if line.startswith("glaeda-gh: still waiting on pr:o/r#1: ")]
+        self.assertTrue(progress, text)
+        self.assertRegex(progress[0], r"\d+s of 0.5s, deadline \d\d:\d\d:\d\dZ; o/r#1 OPEN .*; checks PENDING")
+
+    def test_a_daemon_ruled_wait_keeps_the_state_its_blocker_prints(self) -> None:
+        running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
+        self.put("pr:o/r#1", running)
+        req = gg.wait_request("pr", "o/r#1", "green", 60, False, False, None, True, 0)
+        d = gg.waits_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        gg.Daemon.note_wait_state(d, "1-x", req)
+        state = (d / "1-x.out.state").read_text()
+        self.assertTrue(state.startswith("o/r#1 OPEN") and state.count("\n") == 1, state)
+        self.assertIn("checks PENDING", state)
+        self.assertIn(".out.state", gg.WAIT_FILES)
+        self.assertIn('$out.state', gg.BLOCKER)
+
+    def test_status_says_not_found_and_could_not_judge_apart(self) -> None:
+        self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
+        self.put("pr:o/r#5", None, error="graphql: HTTP 502")
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_status("pr", "o/r#404", False, False, first_wait=0), gg.EXIT_FAIL)
+            self.assertEqual(gg.cmd_status("pr", "o/r#5", False, True, first_wait=0), gg.EXIT_DOWN)
+        plain, doc = out.getvalue().split("\n{", 1)
+        self.assertEqual(plain.strip().splitlines()[-1], "next: gh pr list -R o/r --state all --limit 5")
+        doc = json.loads("{" + doc)
+        self.assertEqual((doc["ok"], doc["code"], doc["next"]), (False, "no-data-yet", "glaeda-gh wait pr o/r#5 --timeout 600"))
+
+    def test_a_run_github_cannot_resolve_is_missing_only_when_never_read(self) -> None:
+        self.daemon.now = NOW
+        entries = [{"key": "run:o/r/1", "cache": None}, {"key": "run:o/r/2", "cache": {"data": {"id": 2}}}]
+        with mock.patch.object(self.daemon, "graphql", return_value=({"data": {"w0": None, "w1": None}}, None)):
+            self.daemon.fetch_runs_graphql(entries)
+        self.assertTrue(gg.read_cache("run:o/r/1")["missing"])
+        self.assertFalse(gg.read_cache("run:o/r/2").get("missing"))  # it had data: an error, not gone
+        limited = {"data": {"w0": None}, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}
+        with mock.patch.object(self.daemon, "graphql", return_value=(limited, None)):
+            self.daemon.fetch_runs_graphql([{"key": "run:o/r/3", "cache": None}])
+        self.assertFalse(gg.read_cache("run:o/r/3").get("missing"))
+
+    def test_a_never_read_key_a_wait_is_on_goes_ahead_of_deferred_ones(self) -> None:
+        self.daemon.now = NOW
+        old = [{"key": f"pr:o/r#{n}", "cache": {"data": {}, "fetchedAt": NOW - 999}, "touched": NOW} for n in range(1, 4)]
+        new = {"key": "pr:o/r#999", "cache": None, "touched": NOW, "waitedAt": NOW}
+        self.daemon.deferred = {e["key"] for e in old}
+        due = [e["key"] for e in self.daemon.due("pr", old + [new])]
+        self.assertEqual(due[0], "pr:o/r#999")
+        self.assertEqual(due[1:], [e["key"] for e in old])
+
+    def test_a_usage_error_names_the_right_form(self) -> None:
+        self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
+                         "glaeda-gh wait pr manaflow-ai/cmuxterm-hq#0 --timeout 1800")
+        self.assertEqual(gg.usage_next(["status", "pr", "o/r", "#7", "--json"]), "glaeda-gh status pr o/r#7 --json")
+        self.assertEqual(gg.usage_next(["wait", "bogus"]), "glaeda-gh wait --help")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting"), self.assertRaises(SystemExit) as exit_:
+            gg.main(["wait", "pr", "o/r", "3", "--json"])
+        self.assertEqual(exit_.exception.code, 64)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
+        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#3 --json --timeout 1800")
 
     def test_rerun_after_cancel_counts_the_latest_attempt(self) -> None:
         old = {**check_run("Web complexity", conclusion="CANCELLED"), "databaseId": 1, "startedAt": "2026-09-25T10:00:00Z"}
@@ -3158,16 +3267,19 @@ class ClientTest(Base):
         doc = json.loads(text)
         self.assertEqual([d["key"] for d in doc], ["pr:o/r#1", "pr:o/r#2"])
         self.assertEqual(doc[1]["data"]["checkState"], "FAILURE")
-        # one without data yet: its entry is still listed, and the exit says not everything was there
+        # one without data yet: its entry is still listed, and the exit says not everything was there (3: a
+        # target the daemon has not read is one it could not judge, not a failure)
         code, text = self.status("pr", ["o/r#1", "3"], False, True)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, gg.EXIT_DOWN)
         self.assertEqual([d["key"] for d in json.loads(text)], ["pr:o/r#1", "pr:o/r#3"])
 
     def test_one_target_prints_exactly_what_it_always_has(self) -> None:
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a")])))
         entry = gg.read_cache("pr:o/r#1")
-        self.assertEqual(self.status("pr", "o/r#1", False, True), (0, gg.render("pr:o/r#1", entry, True)))
-        self.assertEqual(self.status("pr", ["o/r#1"], False, True), (0, gg.render("pr:o/r#1", entry, True)))
+        # --json adds the agent output contract's ok, code, reason and next to the same object
+        ok = gg.ok_fields()
+        self.assertEqual(self.status("pr", "o/r#1", False, True), (0, gg.render("pr:o/r#1", entry, True, ok)))
+        self.assertEqual(self.status("pr", ["o/r#1"], False, True), (0, gg.render("pr:o/r#1", entry, True, ok)))
         self.assertEqual(self.status("pr", ["o/r#1"], False, False), (0, gg.render("pr:o/r#1", entry, False)))
 
     def test_field_prints_just_those_values(self) -> None:
@@ -3178,7 +3290,7 @@ class ClientTest(Base):
         fields = gg.parse_fields("head,checks.failed")
         self.assertEqual(self.status("pr", "o/r#1", False, False, fields=fields), (0, f"{'a' * 40}\tlint,test\n"))
         code, text = self.status("pr", ["o/r#1", "2", "3"], False, False, fields=gg.parse_fields("state,checks.state"))
-        self.assertEqual(code, 1)  # #3 has no data yet: an empty row, not an error
+        self.assertEqual(code, gg.EXIT_DOWN)  # #3 has no data yet: an empty row, and a target not judged (3)
         self.assertEqual(text, "o/r#1\tOPEN\tFAILURE\no/r#2\tMERGED\tSUCCESS\no/r#3\t\t\n")
         code, text = self.status("pr", "o/r#2", False, False, fields=gg.parse_fields("isDraft,checks.total,url"))
         self.assertEqual(text, "false\t1\thttps://github.com/o/r/pull/2\n")
@@ -3193,7 +3305,7 @@ class ClientTest(Base):
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
             self.status("pr", ["o/r#1", "9"], False, False, fields=["head", "hed"])
         self.assertEqual(self.status("pr", "o/r#9", False, False, fields=["head", "checks.failed", "mergeable"]),
-                         (1, "\t\t\n"))
+                         (gg.EXIT_DOWN, "\t\t\n"))
         for bad in ("", "head,", "checks..failed"):
             with self.subTest(bad=bad), self.assertRaises(gg.WatchError):
                 gg.parse_fields(bad)
@@ -5809,6 +5921,10 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                 done, _ = cli_run(self.ghdir, *args, "--json",
                                   shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
                 self.assertEqual(done.returncode, 3, done.stdout)
+                if args[0] in ("wait", "status"):
+                    # the agent output contract: the one {ok, code, reason, next} object, and only it
+                    assert_json_refusal(self, done.stdout, "daemon-down")
+                    continue
                 self.assertNotIn("daemon is not running", done.stdout,
                                  "the daemon-down notice went to stdout")
                 # `budget --json` answers with a document even when the daemon is down, so the
@@ -5857,7 +5973,7 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                             f"{gg.DOWN_GRACE + 2:g}", "--json",
                             shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
         self.assertEqual(closed.returncode, 3, closed.stdout)
-        self.assertEqual(closed.stdout, "", "the restart notice went to stdout")
+        assert_json_refusal(self, closed.stdout, "daemon-down")
 
     def with_a_daemon(self, daemon_json: dict) -> None:
         """A held lock and a `daemon.json`, which is all the CLI reads to decide the daemon is
@@ -5897,7 +6013,10 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                                     "--json",
                                     shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
                 self.assertEqual(closed.returncode, code, closed.stdout)
-                self.assertNotIn(want, closed.stdout, f"{name}: the notice went to stdout")
+                if name == "failing":  # --json: the agent output contract's one object, and only it
+                    assert_json_refusal(self, closed.stdout, "daemon-failing")
+                else:
+                    self.assertNotIn(want, closed.stdout, f"{name}: the notice went to stdout")
                 if closed.stdout:
                     json.loads(closed.stdout)  # and the document is still one document
 
@@ -5917,7 +6036,8 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                     done, _ = cli_run(self.ghdir, "wait", "file", str(self.dir / "x"),
                                       "--timeout", bad, "--json", stderr=fh)
                 self.assertEqual(done.returncode, 64, done.stdout)
-                self.assertEqual(done.stdout, "", "the usage error went to stdout")
+                # the agent output contract: --json is one {ok, code, reason, next} object, and no diagnostic
+                assert_json_refusal(self, done.stdout, "usage")
                 said = err.read_text()
                 self.assertIn("is not a number of seconds", said)
                 # The usage text as well as the reason: a message naming a flag, with no shape of
@@ -5934,14 +6054,14 @@ class DaemonDiagnosticOnFd2Test(unittest.TestCase):
                 with err.open("w") as fh:
                     done, _ = cli_run(self.ghdir, *args, "--json", stderr=fh)
                 self.assertEqual(done.returncode, 64, done.stdout)
-                self.assertEqual(done.stdout, "", "the refusal went to stdout")
+                assert_json_refusal(self, done.stdout, "refused")
                 self.assertIn(reason, err.read_text())
         for args in (["wait", "file", str(self.dir / "x"), "--timeout", "-5"],
                      ["wait", "pr", "o/r#1", "--author", "x"]):
             closed, _ = cli_run(self.ghdir, *args, "--json",
                                 shell_prefix=("/bin/sh", "-c", 'exec 2>&-; exec "$@"', "sh"))
             self.assertEqual(closed.returncode, 64)
-            self.assertEqual(closed.stdout, "", args)
+            assert_json_refusal(self, closed.stdout, None)
         # A timeout that is merely 0 is a legitimate "look once", not a bad argument.
         with (self.dir / "once.txt").open("w") as fh:
             once, _ = cli_run(self.ghdir, "wait", "file", str(self.dir / "x"), "--timeout", "0",
@@ -6361,7 +6481,7 @@ class WaitSubscriptionTest(Base):
     def test_the_subscribe_path_says_the_line_once_before_it_blocks(self) -> None:
         said: list[str] = []
         with mock.patch.object(gg, "say_waiting", said.append), \
-                mock.patch.object(gg, "block", side_effect=lambda rid, left: said.append("block")):
+                mock.patch.object(gg, "block", side_effect=lambda rid, left, *rest: said.append("block")):
             gg.subscribe_wait("pr", "o/r#1", "green", 60, False, False, None, gg.RESCUE_GRACE)
         self.assertEqual(len([s for s in said if "waiting on" in s]), 1, said)
         self.assertEqual(said[-1], "block", "the line came after the wait blocked")
@@ -6516,8 +6636,8 @@ class FileAndPidWaitTest(unittest.TestCase):
         The deadline is a wall-clock time as well as a duration because the duration alone cannot
         be compared with anything: a reader looking at a line in a file does not know when the
         process started."""
-        at = time.mktime((2026, 10, 21, 13, 0, 0, 0, 0, -1))
-        self.assertEqual(gg.deadline_clock(90, at), "13:01:30")
+        at = 1792587600.0  # 2026-10-21T13:00:00Z: the deadline is UTC with a Z (agent output contract)
+        self.assertEqual(gg.deadline_clock(90, at), "13:01:30Z")
         for timeout in (float("inf"), float("nan"), 1e300):
             self.assertEqual(gg.deadline_clock(timeout, at), "unknown", timeout)
         full, short = "a" * 40, "abc1234"
@@ -6534,7 +6654,7 @@ class FileAndPidWaitTest(unittest.TestCase):
                 # Every kind carries the deadline, not just the helper that formats it: a mutation
                 # dropping the `(at ...)` clause from the line left the suite green while
                 # `deadline_clock`'s own assertions above still passed.
-                self.assertRegex(line, r"giving up after 60s \(at \d\d:\d\d:\d\d\)")
+                self.assertRegex(line, r"giving up after 60s \(at \d\d:\d\d:\d\dZ\)")
         self.assertNotIn(" at ", gg.waiting_line("pid 7", "it exits", None, True, 60).split(" (at ")[0],
                          "a wait with no sha claimed one")
 

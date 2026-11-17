@@ -2502,7 +2502,7 @@ class BalanceTest(Base):
                            "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
                            "event": "push", "run_attempt": 2, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
         self.gh.jobs[7] = [job("build", run_attempt=2)]
-        self.budgets(rest=(300, 3000), graphql=(4000, 1800))
+        self.budgets(rest=(600, 3000), graphql=(4000, 1800))  # poorer, still above the 500 hard reserve
         key = gg.parse_key("run", "o/r/7")
         gg.register(key)
         self.daemon.tick(NOW)
@@ -3376,7 +3376,7 @@ class FallbackTest(Base):
         self.register_all()
         self.daemon.now = NOW
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800},
-                              "graphql": {"limit": 5000, "remaining": 450, "reset": NOW + 1800}}  # below its floor
+                              "graphql": {"limit": 5000, "remaining": 700, "reset": NOW + 1800}}  # below its floor
         self.assertEqual(self.daemon.mode("graphql"), "lean")
         self.assertEqual({kind: self.daemon.route(kind) for kind in gg.CYCLES},
                          {"pr": "rest", "run": "rest", "comment": "rest", "head": "rest"})
@@ -3385,7 +3385,7 @@ class FallbackTest(Base):
         self.assertEqual({kind: self.daemon.route(kind) for kind in gg.CYCLES},
                          {"pr": "graphql", "run": "graphql", "comment": "graphql", "head": "graphql"})
         # both low: nothing to gain, so the cheaper GraphQL reads stay where they are
-        self.daemon.budget["graphql"]["remaining"] = 450
+        self.daemon.budget["graphql"]["remaining"] = 700
         self.assertEqual(self.daemon.route("comment"), "graphql")
 
     def test_force_low_is_read_from_the_config_and_reads_go_to_rest(self) -> None:
@@ -3568,7 +3568,7 @@ class FallbackTest(Base):
         self.daemon.now = NOW
         # GraphQL below its floor but about to reset, so "richer" per second than a normal REST
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 2000, "reset": NOW + 3000},
-                              "graphql": {"limit": 5000, "remaining": 450, "reset": NOW + 60}}
+                              "graphql": {"limit": 5000, "remaining": 700, "reset": NOW + 60}}
         self.assertGreater(self.daemon.richness("graphql"), self.daemon.richness("rest"))
         self.daemon.paths["pr"] = "graphql"
         self.assertEqual(self.daemon.route("pr"), "rest")
@@ -5109,7 +5109,7 @@ class BudgetOutputTest(Base):
     def test_budget_shows_both_buckets_the_paths_and_the_split(self) -> None:
         self.gh.prs[("o", "r", 1)] = pr_node(1)
         self.gh.runs[7] = {"id": 7, "status": "queued", "html_url": "u"}
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 300, "reset": NOW + 3000},
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 600, "reset": NOW + 3000},
                               "graphql": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800}}
         gg.register("pr:o/r#1")
         gg.register("run:o/r/7")
@@ -7176,8 +7176,8 @@ class HeadChecksTest(Base):
         self.assertEqual(sum(1 for sha in (SHA_A, SHA_B, SHA_C) if gg.read_cache(self.key(sha))), 2)
 
     def test_a_lean_quota_serves_only_reserved_consumers(self) -> None:
-        self.daemon.note_budget("graphql", 5000, gg.FLOORS["graphql"][0] - 50, NOW + 1800)
-        self.daemon.note_budget("rest", 5000, gg.FLOORS["rest"][0] - 50, NOW + 1800)  # both low: nowhere to go
+        self.daemon.note_budget("graphql", 5000, self.daemon.policy["floors"]["graphql"][0] - 50, NOW + 1800)
+        self.daemon.note_budget("rest", 5000, self.daemon.policy["floors"]["rest"][0] - 50, NOW + 1800)  # both low
         gg.register(self.key(SHA_A), consumer="session-1")
         gg.register(self.key(SHA_B), consumer="autoland")
         self.daemon.tick(NOW)
@@ -13463,7 +13463,11 @@ class DaemonPolicyTest(Base):
         self.assertEqual(policy["cycle"], 60)
         self.assertEqual(policy["commentCycle"], 15)
         self.assertEqual(policy["cycles"], {"pr": 60, "run": 60, "comment": 15, "head": 60})
-        self.assertEqual(policy["floors"], {"rest": (1500, 300), "graphql": (500, 100)})
+        # the module's reserves (300, 100) are raised to the 500-call hard reserve; GraphQL's floor keeps its band
+        self.assertEqual(policy["floors"], {"rest": (1500, 500), "graphql": (900, 500)})
+        self.assertEqual(policy["hardReserve"], {"rest": 500, "graphql": 500})
+        # the outbox's writes weigh the configured reserves, not the hard reserve (PostJoinTest)
+        self.assertEqual(policy["writeFloors"], {"rest": (1500, 300), "graphql": (500, 100)})
         self.assertEqual(policy["restShare"], 0.4)
 
     def test_values_are_read_and_bad_ones_keep_their_default(self) -> None:
@@ -13471,14 +13475,14 @@ class DaemonPolicyTest(Base):
                         "floors": {"rest": {"floor": 2000, "reserve": 400}, "graphql": {"floor": 800}}})
         policy = self.daemon.policy
         self.assertEqual(policy["cycles"], {"pr": 120, "run": 120, "comment": 30, "head": 120})
-        self.assertEqual(policy["floors"], {"rest": (2000, 400), "graphql": (800, 100)})
+        self.assertEqual(policy["floors"], {"rest": (2000, 500), "graphql": (800, 500)})
         self.assertEqual(policy["restShare"], 0.25)
         # out of range, the wrong type, NaN, a bool, and a reserve above its floor
         self.configure({"cycle": 1, "commentCycle": "5", "restShare": -0.1, "floors": {
             "rest": {"floor": 100, "reserve": 200}, "graphql": {"floor": True, "reserve": float("nan")}}})
         policy = self.daemon.policy
         self.assertEqual(policy["cycles"], {"pr": 60, "run": 60, "comment": 15, "head": 60})
-        self.assertEqual(policy["floors"], {"rest": (1500, 300), "graphql": (500, 100)})
+        self.assertEqual(policy["floors"], {"rest": (1500, 500), "graphql": (900, 500)})
         self.assertEqual(policy["restShare"], 0.4)
         self.configure({"restShare": 7, "cycle": 100000})
         self.assertEqual((self.daemon.policy["restShare"], self.daemon.policy["cycle"]), (0.4, 60))
@@ -15403,6 +15407,48 @@ class PrProbeTest(Base):
         self.assertLess(new, old / 3)
 
 
+class HardReserveFloorTest(Base):
+    """2026-11-17: the shared login's REST read 0 of 5000 at 04:15Z and 05:05Z, and Leo's own Claude app showed "GitHub
+    rate limit" on a PR link's hover (Leo: "this is... interesting. so claude desktop shows rate limit on hover of the
+    github links sometimes..."). The daemon's reserve for its own reads was 300 REST and 100 GraphQL; it is now never
+    under hard_reserve_calls (500 each by default, leo-workspace machines/gh-quota.json)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.policy = Path(self.tmp.name) / "gh-quota.json"
+        env = mock.patch.dict(os.environ, {"GLAEDA_GH_QUOTA_POLICY": os.fspath(self.policy)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
+
+    def test_the_reserve_is_at_least_the_hard_reserve(self) -> None:
+        gg.write_json(gg.DAEMON_CONFIG, {"floors": {"rest": {"floor": 400, "reserve": 300},
+                                                    "graphql": {"floor": 200, "reserve": 100}}})
+        floors = gg.daemon_policy()["floors"]
+        self.assertEqual(floors, {"rest": (600, 500), "graphql": (600, 500)}, "the floor keeps its band above it")
+        self.policy.write_text(json.dumps({"hard_reserve_calls": {"rest": 800, "graphql": 0}}))
+        floors = gg.daemon_policy()["floors"]
+        self.assertEqual((floors["rest"], floors["graphql"]), ((900, 800), (600, 500)), "0 never empties it")
+        gg.write_json(gg.DAEMON_CONFIG, {"floors": {"graphql": {"floor": 1500, "reserve": 1000}}})
+        self.assertEqual(gg.daemon_policy()["floors"]["graphql"], (1500, 1000), "a higher reserve stays")
+
+    def test_a_read_under_the_hard_reserve_stops_above_it_goes_on(self) -> None:
+        self.daemon.policy = gg.daemon_policy()
+        self.daemon.now = NOW
+        for left, stops in ((499, True), (500, False), (2000, False)):
+            self.daemon.budget["rest"] = {"limit": 5000, "remaining": left, "reset": NOW + 1800, "seenAt": NOW}
+            self.daemon.budget["graphql"] = {"limit": 5000, "remaining": left, "reset": NOW + 1800, "seenAt": NOW}
+            self.assertEqual(self.daemon.mode("rest") == "stop", stops, left)
+            self.daemon.waived = True  # a waited read: no exception into the hard reserve
+            self.assertEqual(self.daemon.mode("graphql") == "stop", stops, left)
+            self.daemon.waived = False
+        self.daemon.budget["rest"]["remaining"] = 499
+        hold = self.daemon.quota_hold("pr") if self.daemon.paths.get("pr") == "rest" else None
+        if hold is not None:
+            self.assertTrue(hold[1])
+            self.assertIn("resets", hold[0])
+
+
 class WaitedUnderReserveTest(Base):
     """huge-blue 2026-11-16: GraphQL sat under the fleet's 1000-point reserve for lands (mode stop) for 5.5 of the
     day's 14 hours, and REST at the daemon's share or its own reserve for most of them. due() returns nothing in a
@@ -15416,6 +15462,9 @@ class WaitedUnderReserveTest(Base):
 
     def setUp(self) -> None:
         super().setUp()
+        # The fleet's reserve for lands (config/gh-daemon.json): waited reads yield it, never the hard reserve under it.
+        gg.write_json(gg.DAEMON_CONFIG, {"floors": {"graphql": {"floor": 1500, "reserve": 1000}}})
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
         self.gh.counts = True
         for n in range(1, 13):  # #11 and #12: watched, nobody waits on them
             self.gh.prs[("o", "r", n)] = pr_node(n, rollup="PENDING", checks=[check_run("a"), check_run(
@@ -15473,6 +15522,22 @@ class WaitedUnderReserveTest(Base):
         self.under(int(self.reserve * gg.WAITED_RESERVE_SHARE) - 1)
         self.at(NOW + 6 * gg.CYCLE)
         self.assertEqual(self.gh.probes, 1, "read past the part of the reserve kept for lands")
+
+    def test_waited_reads_never_go_into_the_hard_reserve(self) -> None:
+        # 2026-11-17: the login's REST read 0 of 5000 and Leo's own Claude app showed "GitHub rate limit". Waited
+        # reads yield the fleet's reserve down to WAITED_RESERVE_SHARE of it, never into hard_reserve_calls.
+        hard = gg.daemon_policy()["hardReserve"]["graphql"]
+        self.assertGreaterEqual(hard, 500)
+        sent = lambda: len([c for c in self.gh.calls if c[1].endswith("/graphql")])  # noqa: E731
+        with mock.patch.object(gg, "WAITED_RESERVE_SHARE", 0.1):
+            self.under(hard + 5)
+            before = sent()
+            self.at(NOW + gg.CYCLE)
+            self.assertGreater(sent(), before, "above the hard reserve a waited read is still made")
+            self.under(hard - 1)
+            before = sent()
+            self.at(NOW + 3 * gg.CYCLE)
+            self.assertEqual(sent(), before, "a waited read spent the hard reserve")
 
     def test_many_waited_prs_are_paced_slower_never_refused(self) -> None:
         with mock.patch.object(gg, "WAITED_PER_MINUTE", 1), mock.patch.object(gg, "WAITED_PROBE_BATCH", 4):

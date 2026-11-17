@@ -16396,6 +16396,7 @@ class LandWorld:
         self.merged_on_merge = True
         self.raise_on: str | None = None
         self.nudged: list[str] = []
+        self.refreshed: list[str] = []
         self.watched: list[str] = []
         self.notices: list[tuple] = []
         self.gh = Path(tmp) / "bin" / "gh"
@@ -16458,13 +16459,31 @@ class LandTest(Base):
     def setUp(self) -> None:
         super().setUp()
         self.w = LandWorld(self.tmp.name)
+        # The CLI (`glaeda-gh land`) resolves merge_hold.py from the host's land.json and defaults: pin the defaults to
+        # the fake one, so the tests never depend on the host having a leo-workspace checkout (a CI runner has none).
+        paths = mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),))
+        paths.start()
+        self.addCleanup(paths.stop)
         self.t = NOW
         self.q = self.queue()
 
     def queue(self) -> Any:
         return gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
                             nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
-                            config=self.w.config)
+                            config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
+                            behind=lambda *a: self.stale_why)
+
+    stale_why: str | None = None  # what the checkout-staleness check answers
+
+    upstream = False  # this host reads PRs through an upstream (a lane VM)
+    fresh_head: str | None = None  # what a direct read (refresh) stores, or None for a read that fails
+
+    def refresh(self, key: str) -> str | None:
+        self.w.refreshed.append(key)
+        if self.fresh_head is None:
+            return "lane-gh call get: quota"
+        self.w.set_pr(key, land_pr(self.fresh_head), self.t)
+        return None
 
     def land(self, target: str = "o/r#1", after: list[str] | None = None, requester: str = "host/lane") -> None:
         gg.land_request("land", target, after or [], requester)
@@ -16912,22 +16931,146 @@ class LandTest(Base):
         with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (checkout,)):
             self.assertEqual(self.q.merge_hold()[0], deploy)
 
-    def test_no_merge_hold_anywhere_stops_at_once_naming_every_path(self):
-        """The detector for a retry that hides a permanent failure: no merge_hold.py is a stop on the first judgment,
-        named merge_hold_missing with each path tried, never explain_failed and a retry."""
+    def test_no_merge_hold_anywhere_the_worker_refuses_to_start_until_one_is_there(self):
+        """The startup check (the detector for a configured path that does not exist, used silently): with no
+        merge_hold.py at land.json's mergeHold or any default, the land worker judges and steps nothing, says why once
+        (refused.json, a notice, `land status`) naming each path tried, and starts on the tick after one appears."""
         gone = [Path(self.tmp.name) / d / "merge_hold.py" for d in ("conf", "deploy", "checkout")]
         self.w.config["mergeHold"] = os.fspath(gone[0])
         with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", tuple(gone[1:])):
             self.pr(LA)
             self.land()
             e = self.tick()
-        self.assertEqual(self.w.explains(), [])  # nothing was run
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_hold_missing"))
-        for p in gone:
-            self.assertIn(os.fspath(p), e["stop"]["reason"])
-        self.assertIn("mergeHold", e["stop"]["next"])
-        self.assertIn("merge_hold_missing", self.w.sent()[-1][-1])
-        self.assertIn("merge_hold_missing: merge_hold.py is not at", gg.land_line(e, time.time()))
+            self.tick()
+            self.assertEqual(self.w.explains(), [])  # nothing was run
+            self.assertEqual(e["state"], "queued")  # held, not stopped: it lands once the worker starts
+            refused = gg.read_json(gg.land_dir() / gg.LAND_REFUSED_FILE)
+            self.assertEqual(refused["code"], "merge_hold_missing")
+            self.assertEqual(refused["tried"], [os.fspath(p) for p in gone])
+            self.assertIn("mergeHold", refused["next"])
+            self.assertEqual([n[0] for n in self.w.notices], ["land-refused"])  # said once, not every tick
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                gg.cmd_land_status(None, False)
+            self.assertIn("REFUSED to start", out.getvalue())
+            self.assertIn(os.fspath(gone[0]), out.getvalue())
+            # A daemon restarted while it is missing still knows it said so.
+            self.q = self.queue()
+            self.tick()
+            self.assertEqual([n[0] for n in self.w.notices], ["land-refused"])
+            # Installed: the next tick starts the worker and judges the entry at the configured path.
+            gone[0].parent.mkdir(parents=True)
+            gone[0].write_text("")
+            self.w.mh = os.fspath(gone[0])
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+        self.assert_merged_at(LA)
+        self.assertFalse((gg.land_dir() / gg.LAND_REFUSED_FILE).exists())
+        self.assertEqual(self.w.notices[1][0], "land-started")
+
+    def test_land_refuses_to_queue_with_no_merge_hold(self):
+        gone = Path(self.tmp.name) / "conf" / "merge_hold.py"
+        said: list[str] = []
+        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", ()), \
+                mock.patch.object(gg, "land_config", return_value={"mergeHold": os.fspath(gone)}), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False)
+        self.assertEqual(rc, gg.EXIT_FAIL)
+        self.assertIn(f"refused: merge_hold.py is not at any of {gone}", said[0])
+        self.assertIn("then glaeda-gh land o/r#1", said[0])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")) if gg.LandQueue.requests_dir().is_dir()
+                         else [], [])
+
+    def test_explain_stops_when_merge_hold_vanishes_after_the_startup_check(self):
+        gone = Path(self.tmp.name) / "gone" / "merge_hold.py"
+        self.w.config["mergeHold"] = os.fspath(gone)
+        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", ()):
+            got = self.q.explain({"repo": "o/r", "number": 1}, LA)
+        self.assertEqual((got["code"], got["action"]["kind"]), ("merge_hold_missing", "stop"))
+        self.assertIn("then glaeda-gh land o/r#1", got["next"])
+
+    def test_upstream_host_reads_a_stale_landing_pr_itself(self):
+        """gcp-agent-lane-6, 2026-11-17: on a lane VM the PR data is the controller's copy and the worker's nudge
+        reaches nothing; cmux#44537's copy was 8923 s old two minutes after the worker's own update-branch. A copy
+        older than LAND_REFRESH_AFTER is read through the broker before the entry is judged."""
+        self.upstream = True
+        self.fresh_head = LB
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - gg.LAND_REFRESH_AFTER - 1
+        self.land()
+        e = self.tick()
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.assertEqual(self.w.explains(), [])  # not judged on the stale copy
+        self.assertIsNone(e["refresh"]["error"])
+        self.w.answers.append(ok_answer(LB))
+        self.tick()
+        self.assert_merged_at(LB)  # the head the fresh read showed
+        self.assertEqual(self.w.refreshed, [self.KEY])
+
+    def test_a_failed_refresh_is_not_retried_at_once_and_does_not_hold_the_entry(self):
+        self.upstream = True
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 3600
+        self.land()
+        e = self.tick()
+        self.assertIn("quota", e["refresh"]["error"])
+        self.w.answers.append(ok_answer(LA))
+        self.tick()  # judged on the copy it has
+        self.assert_merged_at(LA)
+        self.assertEqual(self.w.refreshed, [self.KEY])
+
+    def test_refresh_pacing_and_only_on_upstream_hosts(self):
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 3600
+        e = {"key": self.KEY, "state": "waiting", "wait": {"kind": "pr"}}
+        self.assertFalse(self.q.refresh_due(e, self.w.cache[self.KEY]))  # a host with its own login: no
+        self.upstream = True
+        self.q = self.queue()
+        self.q.now = self.t
+        e["refresh"] = {"at": self.t - gg.LAND_REFRESH_AFTER - 1}
+        self.assertFalse(self.q.refresh_due(e, self.w.cache[self.KEY]))  # a plain wait: every LAND_REFRESH_EVERY
+        e["wait"] = {"kind": "head_change", "before": LA, "since": self.t}
+        self.assertTrue(self.q.refresh_due(e, self.w.cache[self.KEY]))  # waiting on a pushed head: sooner
+        self.w.cache[self.KEY]["dataAt"] = self.t - 5
+        e["refresh"] = {}
+        self.assertFalse(self.q.refresh_due(e, self.w.cache[self.KEY]))  # a fresh copy: no read
+
+    def test_a_stale_merge_hold_checkout_warns_once_and_clears(self):
+        """gcp-codex-lane-12, 2026-11-17: a lane VM's leo-workspace sat at #5512 and its merge_hold refused every merge
+        as unreadable. The startup check warns (never refuses) once, prints in `land status`, and clears once."""
+        self.stale_why = "merge_hold.py's checkout /ws is stale: 30 commits behind origin/main (over 20)"
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)  # a warning, not a refusal
+        self.assertEqual([n[0] for n in self.w.notices if n[0].startswith("land-checkout")], ["land-checkout-stale"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.cmd_land_status(None, False)
+        self.assertIn("WARNING: merge_hold.py's checkout /ws is stale", out.getvalue())
+        self.tick(gg.LAND_MH_BEHIND_EVERY + 1)
+        self.assertEqual(len([n for n in self.w.notices if n[0] == "land-checkout-stale"]), 1)  # said once
+        self.stale_why = None
+        self.tick(gg.LAND_MH_BEHIND_EVERY + 1)
+        self.assertFalse((gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE).exists())
+
+    def test_checkout_behind_reads_commits_hours_and_fetch_age(self):
+        fetch = Path(self.tmp.name) / "FETCH_HEAD"
+        fetch.write_text("")
+        now = fetch.stat().st_mtime
+        answers = {"rev-parse --show-toplevel": "/ws", "rev-list --count HEAD..origin/main": "28",
+                   "log -1 --format=%ct HEAD": str(int(now - 9 * 3600)), "log -1 --format=%ct origin/main": str(int(now)),
+                   "rev-parse --path-format=absolute --git-path FETCH_HEAD": os.fspath(fetch)}
+        git = lambda args: answers.get(" ".join(args))  # noqa: E731
+        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, now, git)
+        self.assertIn("28 commits behind origin/main (over 20)", why)
+        self.assertIn("9.0 h newer than HEAD", why)
+        self.assertIn("/ws/tools/ws-deploy --local", why)
+        self.assertNotIn("last fetched", why)
+        self.assertIn("last fetched 7.0 h ago", gg.land_checkout_behind(Path("/ws/x"), 100, 6.0, now + 7 * 3600, git))
+        self.assertIsNone(gg.land_checkout_behind(Path("/ws/x"), 100, 24.0, now, git))
+        self.assertIsNone(gg.land_checkout_behind(Path("/nogit/x"), 0, 0.1, now, lambda args: None))
 
     def test_status_names_why_explain_failed(self):
         e = {"key": self.KEY, "state": "waiting", "explain": {"code": "explain_failed",

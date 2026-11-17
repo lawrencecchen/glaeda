@@ -17633,6 +17633,311 @@ class LandTest(Base):
         self.assertIsNotNone(self.daemon.land_queue)
 
 
+class LandForwardTest(Base):
+    """land.json's "executor": a host that only forwards its lands. cosmic-gray (Leo's Mac), 2026-11-17: load 48 on 15
+    cores, swap 9.4 of 10.7 GB, its land queue running merge_hold (base_red_excuse.py x5, pr_owner.py x2) for every
+    queued PR. With an executor named, this host judges nothing: the executor's queue does, and tells the requester."""
+
+    queue = LandTest.queue
+    refresh = LandTest.refresh
+    land = LandTest.land
+    tick = LandTest.tick
+    pr = LandTest.pr
+    KEY = LandTest.KEY
+    stale_why = None
+    upstream = False
+    fresh_head = None
+
+    EXEC = ["reach", "big-exec", ".local/bin/glaeda-gh", "land", "serve"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.w = LandWorld(self.tmp.name)
+        for patch in (mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),)),
+                      mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(Path(self.tmp.name) / "gh-quota")})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.t = NOW
+        self.q = self.queue()
+        self.exec_base = Path(self.tmp.name) / "exec-gh"
+        self.sent_batches: list[dict] = []
+        self.exec_down = False
+
+    def executor_serve(self, request: dict) -> dict:
+        """The executor's `land serve` in this process, over its own BASE and with no executor of its own."""
+        if self.exec_down:
+            raise gg.WatchError("land executor: reach: ssh: connect to host big-exec: Connection refused")
+        self.sent_batches.append(copy.deepcopy(request))
+        saved = gg.BASE
+        gg.BASE = self.exec_base
+        try:
+            with mock.patch.object(gg, "land_config", return_value={"mergeHold": self.w.mh}), \
+                    mock.patch.object(gg, "daemon_running", return_value=True), \
+                    mock.patch.object(gg, "policy_host", return_value="big-exec"), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                gg.cmd_land_serve(json.dumps(request))
+        finally:
+            gg.BASE = saved
+        return json.loads(out.getvalue().strip().splitlines()[-1])
+
+    def forwarding(self) -> Any:
+        self.w.config["executor"] = list(self.EXEC)
+        return gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
+                            nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
+                            config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                            behind=lambda *a: None, forward=lambda cmd, req, deadline: self.executor_serve(req))
+
+    def executor_queue(self) -> Any:
+        saved = gg.BASE
+        gg.BASE = self.exec_base
+        try:
+            cfg = {k: v for k, v in self.w.config.items() if k != "executor"}
+            return gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
+                                nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
+                                config=cfg, reads_upstream=lambda: False, refresh=self.refresh,
+                                behind=lambda *a: None)
+        finally:
+            gg.BASE = saved
+
+    def exec_tick(self, q: Any) -> None:
+        saved = gg.BASE
+        gg.BASE = self.exec_base
+        try:
+            self.t += 2
+            q.tick(self.t)
+        finally:
+            gg.BASE = saved
+
+    def test_cutover_hands_open_entries_to_the_executor_which_lands_and_notifies(self):
+        # Before: this host's queue has two open entries (one waiting on checks, one after it).
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land("o/r#1", requester="cosmic/coord")
+        self.land("o/r#2", after=["o/r#1"], requester="cosmic/coord")
+        self.tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
+        # The executor is named: the next tick hands both off in one forward and judges nothing here.
+        self.q = self.forwarding()
+        explains = len(self.w.explains())
+        self.tick()
+        self.assertEqual(len(self.sent_batches), 1)
+        self.assertEqual([r["target"] for r in self.sent_batches[0]["requests"]], ["o/r#1", "o/r#2"])
+        self.assertEqual(self.sent_batches[0]["requests"][1]["after"], ["o/r#1"])
+        self.assertEqual({e["state"] for e in self.q.entries.values()}, {"forwarded"})
+        self.assertEqual(self.q.entries[self.KEY]["history"][-1]["event"], "handed_off")
+        for _ in range(3):
+            self.tick(60)
+        self.assertEqual((len(self.sent_batches), len(self.w.explains())), (1, explains))  # nothing more here
+        # The executor's queue takes them, keeps the requester, and lands #1, telling cosmic/coord.
+        x = self.executor_queue()
+        self.exec_tick(x)
+        self.assertEqual(x.entries["pr:o/r#2"]["state"], "waiting_after")
+        self.pr(LA)
+        self.w.answers.append(ok_answer(LA))
+        self.exec_tick(x)
+        self.assertEqual(x.entries[self.KEY]["state"], "merged")
+        self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "cosmic/coord"])
+        # A resend of the same handoff (an answer lost on the way back) is applied once.
+        self.executor_serve(self.sent_batches[0])
+        self.exec_tick(x)
+        self.assertEqual(x.entries[self.KEY]["state"], "merged")
+
+    def test_a_running_step_ends_here_before_its_entry_is_handed_off(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land(requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        self.q.jobs[self.KEY] = None  # a step still running here (reaped on the next pass)
+        self.q.reap = lambda: None
+        self.tick()
+        self.assertEqual(self.sent_batches, [])
+        del self.q.jobs[self.KEY]
+        self.tick()
+        self.assertEqual([r["target"] for r in self.sent_batches[0]["requests"]], ["o/r#1"])
+
+    def test_a_cancel_for_an_entry_still_open_here_is_applied_here_and_never_handed_off(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land(requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        self.exec_down = True
+        self.tick()
+        gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "cosmic/coord")
+        self.exec_down = False
+        self.tick(gg.LAND_FORWARD_RETRY + 1)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "cancelled")
+        self.assertEqual(self.sent_batches, [])
+
+    def test_an_unreachable_executor_keeps_every_request_and_backs_off(self):
+        self.q = self.forwarding()
+        self.exec_down = True
+        self.land("o/r#1", requester="cosmic/coord")
+        self.land("o/r#3", requester="cosmic/coord")
+        self.tick()
+        self.assertEqual(len(list(gg.LandQueue.requests_dir().glob("*.json"))), 2)
+        self.assertEqual(self.w.notices[-1][0], "land-forward-failed")
+        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_FORWARD_FILE)["state"], "failing")
+        self.exec_down = False
+        self.tick(10)  # inside the backoff: not sent
+        self.assertEqual(self.sent_batches, [])
+        self.tick(gg.LAND_FORWARD_RETRY)
+        self.assertEqual([r["target"] for r in self.sent_batches[0]["requests"]], ["o/r#1", "o/r#3"])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")), [])
+        self.assertEqual(self.w.explains(), [])
+        self.assertEqual(self.q.entries, {})
+
+    def test_cli_land_cancel_and_status_go_to_the_executor(self):
+        self.w.config["executor"] = list(self.EXEC)
+        fwd = lambda cmd, req, deadline=gg.LAND_FORWARD_DEADLINE, run=None: self.executor_serve(req)  # noqa: E731
+        with mock.patch.object(gg, "land_config", return_value=self.w.config), \
+                mock.patch.object(gg, "land_forward", side_effect=fwd), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "coord"}), \
+                mock.patch.object(gg, "policy_host", return_value="cosmic"), \
+                mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", ()):  # no merge_hold here: none is needed
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(gg.main(["land", "o/r#1", "--json"]), 0)
+            doc = json.loads(out.getvalue())
+            self.assertEqual((doc["host"], doc["requester"], doc["state"]), ("big-exec", "cosmic/coord", "requested"))
+            self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")) if gg.LandQueue.requests_dir().is_dir()
+                             else [], [])  # nothing waits here
+            x = self.executor_queue()
+            self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+            self.exec_tick(x)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(gg.main(["land", "status", "o/r#1", "--json"]), 0)
+            doc = json.loads(out.getvalue())
+            self.assertEqual((doc["executor"], doc["entries"][0]["state"], doc["entries"][0]["requester"]),
+                             ("big-exec", "waiting", "cosmic/coord"))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(gg.main(["land", "status"]), 0)
+            self.assertIn("this host forwards its lands to big-exec", out.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gg.main(["land", "cancel", "o/r#1"]), 0)
+            self.exec_tick(x)
+            self.assertEqual(x.entries[self.KEY]["state"], "cancelled")
+            # The executor unreachable: the land waits here, for the daemon to forward.
+            self.exec_down = True
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(gg.main(["land", "o/r#2"]), 0)
+            self.assertIn("forwards it to big-exec", out.getvalue())
+            self.assertEqual(len(list(gg.LandQueue.requests_dir().glob("*.json"))), 1)
+        self.assertEqual(self.w.explains(), [])
+
+    def test_serve_refuses_on_a_host_that_forwards_and_on_a_bad_line(self):
+        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "status"}), "not_executor"),
+                                   ({}, "not json", "bad_request"),
+                                   ({}, json.dumps({"op": "land", "target": "nope"}), "bad_request")):
+            with self.subTest(code=code), mock.patch.object(gg, "land_config", return_value=config), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(gg.cmd_land_serve(line), gg.EXIT_FAIL)
+            self.assertEqual(json.loads(out.getvalue())["code"], code)
+
+
+    def test_a_remote_wait_that_ends_with_the_land_still_going_is_a_timeout(self):
+        """Review F1: `land --wait N` forwarded, the executor answering "requested" with no entry, exited 0."""
+        answer = {"ok": True, "state": "requested", "entry": None, "requester": "cosmic/coord", "key": self.KEY}
+        with mock.patch.object(gg, "land_forward", return_value=answer), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_land_forwarded(list(self.EXEC), "o/r#1", [], "cosmic/coord", "", 5, False),
+                             gg.EXIT_TIMEOUT)
+            self.assertEqual(gg.cmd_land_forwarded(list(self.EXEC), "o/r#1", [], "cosmic/coord", "", 0, False),
+                             gg.EXIT_OK)
+
+    def test_serve_with_no_wait_answers_at_once(self):
+        """Review F1: `land serve` with --wait 0 waited a forced 10 s for the executor's daemon to pick it up."""
+        began = time.monotonic()
+        doc = self.executor_serve({"op": "land", "target": "o/r#1", "requester": "cosmic/coord", "id": "x-1",
+                                   "wait": 0})
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertEqual((doc["ok"], doc["state"]), (True, "requested"))
+
+    def test_a_request_the_executor_refuses_is_kept_here_and_said(self):
+        """Review F2: a batch item land_serve_one refused was answered "accepted", so the outbox file was deleted."""
+        self.q = self.forwarding()
+        gg.land_request("land", "o/r#1", [], "cosmic/bad requester")  # a --notify with a space in it
+        gg.land_request("land", "o/r#3", [], "cosmic/coord")
+        self.tick()
+        refused = self.sent_batches[0]["requests"][0]["id"]
+        left = list(gg.LandQueue.requests_dir().iterdir())
+        self.assertEqual([p.suffix for p in left], [".refused"])
+        self.assertEqual(gg.read_json(left[0])["requester"], "cosmic/bad requester")
+        self.assertEqual(self.w.notices[-1][0], "land-forward-refused")
+        self.assertIn(refused, self.w.notices[-1][2])
+        self.tick(60)
+        self.assertEqual(len(self.sent_batches), 1)  # never sent again
+        self.assertEqual(len(list((self.exec_base / "land" / "requests").glob("*.json"))), 1)  # o/r#3 alone
+
+    def test_a_handoff_the_executor_refuses_stops_the_entry_here(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land(requester="cosmic/bad requester")
+        self.tick()
+        self.q = self.forwarding()
+        self.tick()
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_refused"))
+        self.tick(60)
+        self.assertEqual(len(self.sent_batches), 1)
+
+    def test_a_crash_during_the_forward_keeps_the_land_and_the_cancel(self):
+        """Review F3: a direct land or cancel was written to requests/ only after the forward failed, so a crash or a
+        kill during the subprocess call lost it."""
+        self.w.config["executor"] = list(self.EXEC)
+        with mock.patch.object(gg, "land_config", return_value=self.w.config), \
+                mock.patch.object(gg, "land_forward", side_effect=LandCrash("killed mid-forward")), \
+                mock.patch.object(gg, "policy_host", return_value="cosmic"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(LandCrash):
+                gg.main(["land", "o/r#1", "--notify", "cosmic/coord"])
+            got = [gg.read_json(p) for p in sorted(gg.LandQueue.requests_dir().glob("*.json"))]
+            self.assertEqual([(r["op"], r["target"]) for r in got], [("land", "o/r#1")])
+            for p in gg.LandQueue.requests_dir().glob("*.json"):
+                p.unlink()
+            with self.assertRaises(LandCrash):
+                gg.main(["land", "cancel", "o/r#1"])
+            got = [gg.read_json(p) for p in sorted(gg.LandQueue.requests_dir().glob("*.json"))]
+            self.assertEqual([r["op"] for r in got], [gg.LAND_WITHDRAW])
+        # The daemon forwards what was staged: the cancel reaches the executor.
+        self.q = self.forwarding()
+        self.tick()
+        self.assertEqual([r["op"] for r in self.sent_batches[0]["requests"]], [gg.LAND_WITHDRAW])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")), [])
+
+    def test_a_direct_forward_that_succeeds_leaves_nothing_staged(self):
+        self.w.config["executor"] = list(self.EXEC)
+        fwd = lambda cmd, req, deadline=gg.LAND_FORWARD_DEADLINE, run=None: self.executor_serve(req)  # noqa: E731
+        with mock.patch.object(gg, "land_config", return_value=self.w.config), \
+                mock.patch.object(gg, "land_forward", side_effect=fwd), \
+                mock.patch.object(gg, "policy_host", return_value="cosmic"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.main(["land", "o/r#1", "--notify", "cosmic/coord"]), 0)
+            self.assertEqual(gg.main(["land", "cancel", "o/r#1"]), 0)
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")), [])
+        self.assertEqual(len(list((self.exec_base / "land" / "requests").glob("*.json"))), 2)
+
+    def test_benchmark_json_is_one_document(self):
+        """Review F4: `benchmark-land-forward.py --json` printed the queue's land-forwarded log line before the JSON."""
+        done = subprocess.run([sys.executable, "-I", os.fspath(ROOT / "scripts" / "benchmark-land-forward.py"),
+                               "--prs", "2", "--classifier-cpu", "0", "--json"], capture_output=True, text=True,
+                              timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        doc = json.loads(done.stdout)
+        self.assertEqual([(r["mode"], r["requestsLeftHere"]) for r in doc], [("old", 0), ("new", 0)])
+        self.assertEqual((doc[0]["entries"], doc[1]["processes"]), ({"merged": 2}, 1))
+    def test_land_forward_reads_the_last_line_and_names_a_refusal(self):
+        def run(argv, deadline, input_text=None):
+            return subprocess.CompletedProcess(argv, 0, 'noise\n{"ok": true, "accepted": ["1"]}\n', "")
+        self.assertEqual(gg.land_forward(["reach", "h"], {"op": "batch"}, run=run)["accepted"], ["1"])
+
+        def refused(argv, deadline, input_text=None):
+            return subprocess.CompletedProcess(argv, 1, '{"ok": false, "code": "not_executor", "reason": "r"}', "")
+        with self.assertRaisesRegex(gg.WatchError, "not_executor"):
+            gg.land_forward(["reach", "h"], {"op": "batch"}, run=refused)
+
+        def broken(argv, deadline, input_text=None):
+            return subprocess.CompletedProcess(argv, 255, "", "ssh: Could not resolve hostname h\n")
+        with self.assertRaisesRegex(gg.WatchError, "Could not resolve"):
+            gg.land_forward(["reach", "h"], {"op": "batch"}, run=broken)
+
+
 class WaitFromBytecodeTest(unittest.TestCase):
     """A wait re-runs itself once from cached bytecode: the compile heap was 54 MB of each waiter's 57 MB."""
 

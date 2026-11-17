@@ -15728,7 +15728,8 @@ class StaleDataTest(Base):
     def broker_get(self, served: list[str]) -> Callable[..., subprocess.CompletedProcess]:
         """run_bounded as `lane-gh call get REPO -` answers on a lane VM: the broker's GET of one repo path, from
         self.gh's REST view. Records each path in SERVED; any other program is a test failure."""
-        def run(argv: list[str], timeout: float | None = None, input_text: str | None = None) -> Any:
+        def run(argv: list[str], timeout: float | None = None, input_text: str | None = None,
+                env: dict | None = None) -> Any:
             self.assertEqual(argv[1:3], ["call", "get"], argv)
             self.assertLessEqual(timeout or 0, gg.DIRECT_READ_BUDGET)
             repo, args = argv[3], json.loads(input_text or "{}")
@@ -15846,6 +15847,20 @@ class StaleDataTest(Base):
         gg.write_json(gg.waits_dir() / f"{rid}.json", {**req, "began": time.time() - float(req["timeout"]) - gg.WAITS_LEFTOVER - 10})
         self.daemon.serve_waits()
         self.assertFalse((gg.waits_dir() / f"{rid}.json").exists(), "a reused pid would keep it for ever")
+
+    def test_a_direct_read_names_the_upstream_lane_to_the_broker(self) -> None:
+        """hq#12687: the broker serves this daemon's refreshes from the VM's upstream_reserve slice only when lane-gh
+        names lane glaeda-upstream (LANE_GH_LANE), whatever session the daemon was started from."""
+        seen = []
+
+        def fake(argv, timeout=None, input_text=None, env=None):
+            seen.append((argv, (env or {}).get("LANE_GH_LANE")))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "status": 200, "data": {"id": 1}}), "")
+        with mock.patch.object(gg, "run_bounded", fake), mock.patch.dict(os.environ, {"LANE_GH_LANE": "a-session"}):
+            send = gg.broker_transport(["/home/cmux/.local/bin/lane-gh", "call", "get"], lambda: time.monotonic() + 30)
+            send("GET", "https://api.github.com/repos/o/r/pulls/9", {}, None)
+        self.assertEqual(seen[0][0][-2:], ["o/r", "-"])
+        self.assertEqual(seen[0][1], "glaeda-upstream")
 
     def test_a_direct_read_never_writes_the_daemons_rest_spend(self) -> None:
         """The client's Daemon read rest-spend.json at construction; charging a REST read wrote that old copy back over

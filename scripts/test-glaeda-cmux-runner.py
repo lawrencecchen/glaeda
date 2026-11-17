@@ -10831,6 +10831,81 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(answers[names[1]], "the second counts the first: 20.6 GiB")
         self.assertIn("25.9 GiB required", answers[names[2]] or "", "the third would not fit beside them")
 
+    def test_a_running_job_is_charged_only_what_it_has_still_to_write(self) -> None:
+        """RUNNER_JOB_WRITTEN ("reservation counted twice"; Leo: "disk floors and probes warn, never refuse").
+        2026-11-17 12:36Z-12:55Z cmux17/18/19/21 held side-std listeners at 25-35 GiB free while 160 jobs queued: a
+        running job's full p95 was reserved although it had already written it. A job that wrote 5 GiB of its 5.3 is
+        charged 0.3; an unmeasured one (no file, another Worker's, stale) still the full 5.3; the next job always 5.3."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3"):
+            (self.tmp / name).mkdir()
+        disk = self.runner_job_disk_file(5.3)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        table = self.workers("actions-runner-glaeda-2", "actions-runner-glaeda-3")  # Workers 100 and 101
+        free = {"gib": 21.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        now = time.time()
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value=table), \
+                mock.patch.object(gate, "evict_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            self.assertIn("21.0 GiB free, 25.9 GiB required", gate.low_disk() or "", "unmeasured: full p95 each")
+            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 5.0, now)
+            self.assertAlmostEqual(hook.job_written_gib(self.state, "actions-runner-glaeda-2", 100), 5.0)
+            self.assertIsNone(gate.low_disk(), "10 + 0.3 + 5.3 + 5.3 = 20.9 GiB: the written 5 GiB is not reserved again")
+            free["gib"] = 20.5
+            why = gate.low_disk()
+            self.assertIn("20.5 GiB free, 20.9 GiB required", why or "")
+            self.assertIn("less 5 GiB the running jobs already wrote (RUNNER_JOB_WRITTEN)", why or "")
+            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 9.0, now)
+            free["gib"] = 20.7
+            self.assertIsNone(gate.low_disk(), "past its p95 a job is charged 0: 10 + 0 + 5.3 + 5.3 = 20.6")
+            free["gib"] = 20.5
+            self.assertIn("20.5 GiB free, 20.6 GiB required", gate.low_disk() or "", "charged 0, never less")
+            free["gib"] = 21.0
+            hook.write_job_written(self.state, "actions-runner-glaeda-2", 77, 5.0, now)
+            self.assertIn("25.9 GiB required", gate.low_disk() or "", "another Worker's file: the full p95")
+            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 5.0,
+                                   now - hook.JOB_WRITTEN_FRESH_S - 60)
+            self.assertIn("25.9 GiB required", gate.low_disk() or "", "a stale file: the full p95")
+            hook.job_written_file(self.state, "actions-runner-glaeda-2").write_text("{nope")
+            self.assertIn("25.9 GiB required", gate.low_disk() or "", "a malformed file: the full p95")
+            # the new job and a listener before it are never discounted, whatever files exist
+            hook.write_job_written(self.state, self.runner.name, 100, 5.0, now)
+            hook.write_job_written(self.state, "actions-runner-glaeda-3", 4242, 5.0, now)
+            self.assertIn("25.9 GiB required", gate.low_disk() or "")
+
+    def test_a_job_measures_what_it_wrote_in_its_work_and_linked_scratch(self) -> None:
+        """The sampler's side of RUNNER_JOB_WRITTEN: _work's and the linked spm-scratch root's growth since first seen,
+        capped by the job's free-disk drop (an APFS clone du counts whole never reads as written); no _work reading:
+        unmeasured, and the file goes so the gates charge the full p95."""
+        runner = self.tmp / "actions-runner-glaeda-2"
+        workspace = runner / "_work/cmux/cmux"
+        package = workspace / "Packages/CmuxNext/Core"
+        package.mkdir(parents=True)
+        scratch = self.tmp / "store/spm-scratch/fp1"
+        (scratch / "Packages__CmuxNext__Core").mkdir(parents=True)
+        sizes = {runner / "_work": 10.0, scratch: 3.0}
+        du = lambda path, _timeout: sizes.get(path)  # noqa: E731
+        tracker = hook.JobWritten(runner / "_work", workspace, du)
+        sizes[runner / "_work"] = 12.0
+        self.assertEqual(tracker.written(50.0), 2.0, "no scratch linked yet: _work's growth")
+        (package / ".build").symlink_to(scratch / "Packages__CmuxNext__Core", target_is_directory=True)
+        self.assertEqual(hook.job_scratch_roots(workspace), [scratch])
+        self.assertEqual(tracker.written(50.0), 2.0, "a scratch root first seen now counts from now")
+        sizes[scratch] = 6.0
+        self.assertEqual(tracker.written(50.0), 5.0)
+        self.assertEqual(tracker.written(1.5), 1.5, "capped by the free-disk drop: clones cost nothing")
+        self.assertIsNone(tracker.written(None), "no free-disk reading: unmeasured")
+        with mock.patch.object(hook, "free_or_none", return_value=40.0):
+            self.assertEqual(hook.report_job_written(tracker, self.state, runner.name, 321, "/", 45.0), 5.0)
+        self.assertEqual(hook.job_written_gib(self.state, runner.name, 321), 5.0, "the gates read what it wrote")
+        sizes.pop(runner / "_work")
+        with mock.patch.object(hook, "free_or_none", return_value=40.0):
+            self.assertIsNone(hook.report_job_written(tracker, self.state, runner.name, 321, "/", 45.0))
+        self.assertFalse(hook.job_written_file(self.state, runner.name).exists(), "unmeasured: the file goes")
+        self.assertIsNone(hook.JobWritten(runner / "_work", workspace, du).written(50.0), "no baseline: unmeasured")
+
     def test_an_installed_hook_reads_the_staged_runner_job_disk(self) -> None:
         """The hook runs from ~/actions-runner-glaeda-K/glaeda-hooks/; the json is the staged runner copy in
         ~/glaeda-runner/scripts."""
@@ -12940,6 +13015,110 @@ class GateTest(unittest.TestCase):
         self.diag("[x INFO BrokerMessageListener] Acknowledging runner request 'next'.\n",
                   "Runner_20260928-140000-utc.log")  # a later listener's file is the one it reads
         self.assertEqual(hook.listener_request(self.runner), "next")
+
+    def stuck_diag(self, acked: float) -> Path:
+        """cmux13s glaeda-12, 2026-11-17: the acknowledge, then GetJobMessageAsync hung with no further line."""
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(acked))
+        return self.diag(f"[{stamp}Z INFO BrokerMessageListener] Acknowledging runner request "
+                         "'f233fe94-dba2-5527-8e6e-65b8ce6fa6bf'.\n"
+                         f"[{stamp}Z INFO GitHubActionsService] AAD Correlation ID for this token request: Unknown\n")
+
+    def free_gate(self) -> hook.Gate:
+        """A real gate over the fake listener with nothing holding it off, its listener up for an hour."""
+        gate = self.started_gate()
+        gate.claimed = lambda: None  # type: ignore[method-assign]
+        gate.confirmed = gate.claimed  # type: ignore[method-assign]
+        gate.listening_since = time.monotonic() - 3600
+        return gate
+
+    def test_a_listener_stuck_acquiring_a_job_is_restarted_past_the_bound(self) -> None:
+        self.stuck_diag(time.time() - hook.GATE_ACQUIRE_STUCK_S - 60)
+        gate = self.free_gate()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIsNone(gate.step())
+        self.assertIsNotNone(gate.stop_deadline, "the stuck listener is stopped through the gate's own path")
+        self.assertIn(f"{hook.LISTENER_STUCK}: the listener acknowledged job request f233fe94", out.getvalue())
+        self.assertIn("started no Runner.Worker", out.getvalue())
+        self.assertIsNotNone(gate.child.wait(timeout=10))
+        lines = (self.state / hook.GATE_RESTARTS_FILE).read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        doc = json.loads(lines[0])
+        self.assertEqual((doc["cause"], doc["runner"], doc["request"]),
+                         (hook.LISTENER_STUCK, "actions-runner-glaeda", "f233fe94-dba2-5527-8e6e-65b8ce6fa6bf"))
+        self.assertGreaterEqual(doc["held_s"], hook.GATE_ACQUIRE_STUCK_S)
+        # the listener is gone: the gate holds it off, then starts a new one once the host is free
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(hook, "GATE_RESTART_FREE_S", 0.0):
+            gate.step()
+            self.assertIsNotNone(gate.held)
+            for _ in range(hook.GATE_CONFIRM + 1):
+                gate.step()
+        self.assertIsNotNone(gate.child)
+        self.assertIsNone(gate.lost_request, "a new listener starts with nothing given up")
+
+    def test_a_listener_acquiring_under_the_bound_is_kept(self) -> None:
+        self.stuck_diag(time.time() - 600)  # the longest acknowledge that ended on its own took 678 s
+        gate = self.free_gate()
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(3):
+                self.assertIsNone(gate.step())
+        self.assertIsNone(gate.stop_deadline)
+        self.assert_listening()
+        self.assertFalse((self.state / hook.GATE_RESTARTS_FILE).exists())
+
+    def test_an_acknowledge_older_than_its_listener_counts_from_the_listener(self) -> None:
+        self.stuck_diag(time.time() - 10 * hook.GATE_ACQUIRE_STUCK_S)
+        gate = self.free_gate()
+        gate.listening_since = time.monotonic() - 60  # a clock that jumped, or a diag older than the listener
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.step()
+        self.assertIsNone(gate.stop_deadline)
+        # the gate's own sighting counts too: past the bound since it first saw the request, it is stuck
+        gate.first_taken = ("f233fe94-dba2-5527-8e6e-65b8ce6fa6bf", time.monotonic() - hook.GATE_ACQUIRE_STUCK_S - 1)
+        gate.acquire_at = -hook.GATE_ACQUIRE_EVERY_S
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.step()
+        self.assertIsNotNone(gate.stop_deadline)
+
+    def test_a_stuck_look_never_stops_a_runner_with_a_worker(self) -> None:
+        self.stuck_diag(time.time() - hook.GATE_ACQUIRE_STUCK_S - 60)
+        gate = self.free_gate()
+        with mock.patch.object(hook.Gate, "worker", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(gate.stuck_acquire())
+            gate.acquire_at = -hook.GATE_ACQUIRE_EVERY_S
+            gate.step()
+        self.assertIsNone(gate.stop_deadline)
+        self.assertIsNone(gate.lost_request)
+        self.assert_listening()
+        # a Worker that comes up at stop()'s frozen last look keeps the listener, and nothing is given up
+        gate.acquire_at = -hook.GATE_ACQUIRE_EVERY_S
+        with mock.patch.object(hook.Gate, "worker", side_effect=[False, True, True, True]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(gate.stuck_acquire())
+        self.assertIsNone(gate.stop_deadline)
+        self.assertIsNone(gate.lost_request)
+        self.assertFalse((self.state / hook.GATE_RESTARTS_FILE).exists())
+
+    def test_the_listener_request_at_reads_the_acknowledge_stamp(self) -> None:
+        self.diag(MID_ACQUIRE_DIAG)
+        self.assertEqual(hook.listener_request_at(self.runner),
+                         ("eeb83692-303d-516a-b3bf-e6e6f93c1d90", 1790603581.0))  # 2026-09-28 13:53:01Z
+        self.diag(MID_ACQUIRE_DIAG + "[2026-09-28 13:53:09Z INFO JobDispatcher] Job request 0 for plan p job "
+                  "eeb83692 received.\n")
+        self.assertEqual(hook.listener_request_at(self.runner), ("eeb83692", 1790603581.0),
+                         "the dispatch keeps the acknowledge's stamp")
+        self.diag("[x INFO BrokerMessageListener] Acknowledging runner request 'next'.\n")
+        self.assertEqual(hook.listener_request_at(self.runner), ("next", None))
+        self.diag(MID_ACQUIRE_DIAG + ACQUIRE_FAILED)
+        self.assertEqual(hook.listener_request_at(self.runner), (None, None))
+
+    def test_listener_restarts_keep_the_last_ones(self) -> None:
+        with mock.patch.object(hook, "GATE_RESTARTS_KEEP", 3):
+            for n in range(5):
+                hook.note_listener_restart(self.state, self.runner, {"t": n})
+        lines = (self.state / hook.GATE_RESTARTS_FILE).read_text().splitlines()
+        self.assertEqual([json.loads(x)["t"] for x in lines], [2, 3, 4])
 
     def test_listen_stops_and_restarts_a_real_listener(self) -> None:
         proc, log = self.run_listen()
@@ -17642,19 +17821,46 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(rows[1], (101, 100, 700.0, "cmux", "swift-frontend"))
         self.assertEqual(calls.count("pid=,ppid=,pcpu=,user=,rss=,comm="), 2, "one ps pass per call, no extra")
 
-    def test_dynamic_release_needs_sustained_quiet_headroom(self) -> None:
+    def test_live_units_follow_the_measured_peak_after_the_grace(self) -> None:
+        """LIVE_UNITS: a daemon-test admitted at its p90 of 6 units on a 14-core mini that runs at about 1 core gives
+        back every unit above ceil(peak * margin) once its warmup is over and a minute of samples covers it."""
         decide = self.hook.dynamic_release_decision
-        self.assertIsNone(decide(100, 20, 2, 5, 0.8, 55, 0, 1, False))
-        self.assertEqual(decide(200, 120, 2, 5, 0.8, 55, 0, 1, False)[0], 1)
-        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 85, 0, 1, False))
-        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 1, 1, False))
-        self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 0, 2, False))
-        # units are cores: a 6-core job quiet after warmup gives back one core at a time, down to half its admission
-        self.assertEqual(decide(200, 120, 6, 14, 1.0, 55, 0, 1, False, admitted=6), (5, "sustained low job CPU with host headroom"))
-        self.assertEqual(decide(200, 120, 4, 14, 1.0, 55, 0, 1, False, admitted=6)[0], 3)
-        self.assertIsNone(decide(200, 120, 3, 14, 1.0, 55, 0, 1, False, admitted=6), "3 is half of 6: it keeps them")
-        self.assertIsNone(decide(200, 120, 3, 14, 1.0, 55, 0, 1, False, admitted=5), "ceil(5 / 2) is 3")
-        self.assertEqual(decide(200, 120, 2, 14, 0.8, 55, 0, 1, False, admitted=2)[0], 1, "a 2-core job still may go to 1")
+        warm = self.hook.DYNAMIC_WARMUP_S
+        cover = self.hook.DYNAMIC_LOW_S
+        keep = decide(warm + 60, 1.0, cover + 30, 6, 14, 45.0, 2, 1, False, ncpu=14)
+        self.assertEqual(keep[0], 2, keep)  # ceil(1.0 * 1.25)
+        self.assertIn("1.00 cores peak", keep[1])
+        self.assertEqual(decide(warm + 60, 0.2, cover, 6, 14, 45.0, 0, 1, False, ncpu=14)[0], 1, "at least 1")
+        # 1 to 3 processes in uninterruptible wait are an idle Mac's noise: they no longer stop a release
+        self.assertIsNotNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 3, 1, False, ncpu=14))
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 5, 1, False, ncpu=14), "contended waits")
+        # the grace: the full p90 at start
+        self.assertIsNone(decide(warm - 1, 1.0, cover, 6, 14, 45.0, 0, 1, False, ncpu=14))
+        self.assertIsNone(decide(warm + 200, 1.0, cover, 6, 14, 45.0, 0, 1, False, ncpu=14, warmup=warm + 300),
+                          "compile-gui's longer warmup")
+        # a job busy near its estimate keeps it, and units never grow back
+        self.assertIsNone(decide(warm + 60, 4.9, cover, 6, 14, 45.0, 0, 1, False, ncpu=14))
+        self.assertIsNone(decide(warm + 60, 9.0, cover, 2, 14, 45.0, 0, 1, False, ncpu=14))
+        self.assertEqual(decide(warm + 60, 2.1, cover, 6, 14, 45.0, 0, 1, False, ncpu=14)[0], 3)
+        # the host's safety brakes keep what it holds
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 85.0, 0, 1, False, ncpu=14), "host at 80%+")
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 0, 2, False, ncpu=14), "memory pressure")
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 0, 1, True, ncpu=14), "thermal")
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 1, 14, 45.0, 0, 1, False, ncpu=14), "one unit stays")
+
+    def test_a_job_without_measurements_keeps_its_p90(self) -> None:
+        decide = self.hook.dynamic_release_decision
+        warm = self.hook.DYNAMIC_WARMUP_S
+        self.assertIsNone(decide(warm + 600, None, 0.0, 6, 14, 30.0, 0, 1, False, ncpu=14), "no sample at all")
+        self.assertIsNone(decide(warm + 600, 1.0, self.hook.DYNAMIC_LOW_S - 1, 6, 14, 30.0, 0, 1, False, ncpu=14),
+                          "samples covering under DYNAMIC_LOW_S")
+        self.assertIsNone(decide(warm + 600, float("nan"), 600, 6, 14, 30.0, 0, 1, False, ncpu=14))
+        # the window keeps only the last DYNAMIC_WINDOW_S: a burst ages out, a gap in samples leaves nothing
+        window = [(0.0, 6.0), (100.0, 1.0), (200.0, 1.0)]
+        peak, covered = self.hook.live_peak(window, 200.0)
+        self.assertEqual((peak, covered), (1.0, 100.0))
+        self.assertEqual(self.hook.live_peak([(0.0, 1.0)], 1000.0), (None, 0.0))
+        self.assertEqual(self.hook.live_peak([], 5.0), (None, 0.0))
 
     def test_reparented_test_app_cpu_belongs_to_exact_live_job(self) -> None:
         first = "/Users/cmux/actions-runner-glaeda"
@@ -18235,6 +18441,38 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertEqual(hook.mem_chunks_total(), 0, "off by default")
             ok, why = self.take("huge")
             self.assertTrue(ok, why)
+
+    def test_live_units_give_back_cores_never_ram(self) -> None:
+        """LIVE_UNITS: a job's holder lets its unit files above the measured need go, so the next admission takes them;
+        its RAM chunks stay held, so a job whose RAM does not fit what is really free is still refused."""
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(5.5, 7000),  # 6 cores, 7 GiB
+                            f"{self.GUEST}/build-fleet-go.yml/small": self.row(1.0, 4000)})  # 1 core, 4 GiB
+        capacity = self.dir / "capacity"
+        state = self.dir / "state"
+        with self.host(14, 16, needs), mock.patch.object(hook, "lock_waiters", return_value=[]), \
+                mock.patch.object(hook, "bounded_waiters", return_value=[]):
+            total = hook.capacity_cores(14)
+            ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "test",
+                                         os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
+            self.assertTrue(ok, why)
+            self.addCleanup(hook.release_holder, hook.holder_file(state))
+            self.assertIn("6/14 units+7/12 GiB", why)
+            taken = lambda prefix, n: sum(not hook.probe(capacity / f"{prefix}-{i}") for i in range(n))  # noqa: E731
+            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 12)), (6, 7))
+            hook.request_dynamic_release(state, 2, {"reason": "test"})
+            deadline = time.monotonic() + 5
+            while taken("unit", 14) > 2 and time.monotonic() < deadline:
+                time.sleep(hook.HOLDER_POLL_S)
+            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 12)), (2, 7), "cores go back, RAM stays")
+            # 12 cores are free now but only 5 GiB of RAM: a 7 GiB job is refused for RAM, a 4 GiB one fits
+            with mock.patch.object(hook, "hold", side_effect=self.keep):
+                ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "test",
+                                             os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
+                self.assertFalse(ok)
+                self.assertTrue(why.startswith("capacity: 5 of 12 GiB of RAM free"), why)
+                ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "small",
+                                             os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
+                self.assertTrue(ok, why)
 
     def test_a_row_for_this_hosts_core_count_and_resident_ram_win(self) -> None:
         """Jobs expand to the cores they find: a by_ncpu row for this host's hw.ncpu comes before the pooled row,

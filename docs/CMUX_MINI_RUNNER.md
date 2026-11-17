@@ -558,7 +558,18 @@ What `--apply` does:
      admitted at 19.8 GiB free failed its link with `ld` errno 28 after 13 minutes), so the listener stops and the
      job goes to a runner with room or waits, slower but never failed. A running job is never stopped or frozen
      for it; the nightly's own listeners, dedicated builders, gateway runners and runners with no floor are never
-     held for disk.
+     held for disk. `RUNNER_JOBS_DISK` also holds it while free disk is under 10 GiB plus one runner job's p95
+     (`glaeda-runner-job-disk.json`) for each job in flight, each idle listener sorted before it, and the next job.
+     Pattern, *reservation counted twice*: a reservation for space a job will write must shrink as the job writes
+     it, or the bytes count once as gone from free disk and again as reserved (2026-11-17 12:36Z-12:55Z: cmux17,
+     cmux18, cmux19 and cmux21 held side-std listeners at 25-35 GiB free with every idle cache deleted while 160
+     side-std jobs queued under 60% CPU). So a running job is charged `max(0, p95 - written)` (`RUNNER_JOB_WRITTEN`):
+     its own sampler measures the growth of its runner's `_work` and of the `spm-scratch` its packages link, every
+     3 minutes with a bounded `du`, capped by its own free-disk drop, and writes it to
+     `~/.local/state/glaeda/cmux-runner/job-written-<runner>.json`; a gate trusts it only for that live
+     `Runner.Worker` and for 9 minutes, else charges the full p95. The detector is the gate's hold line: a
+     `RUNNER_JOBS_DISK` hold whose free disk is well above the floor with no `less ... already wrote` is a
+     reservation that is not shrinking.
      `glaeda-disk --pressure` reads the highest floor among the user's runner hooks and starts freeing at floor
      + 4 GiB, up to floor + 20 GiB (never past half the disk). Cleanup can run during CI and protects live work.
      cmux CI's hot tier (parked PR builds,
@@ -1012,6 +1023,16 @@ job's need fit the host's cores, and their RAM plus this job's fits the host's R
   flag, so rolling a member that has `reserveCores` back below it needs a re-apply from that older checkout.
   `GLAEDA_RUNNER_RAM_LEDGER=0` in the runner's environment turns RAM accounting off. The memory-pressure gate and
   the disk floor stay.
+- Held units follow live use (the hook's LIVE_UNITS; Leo, 2026-11-17: "maximizing the amount of time that we're
+  using our stuff"). A job is admitted at its estimate and keeps it for its first 2 min (`DYNAMIC_WARMUP_S`, 7 for
+  compile-gui). Then its sampler takes the peak of its tree's cores over the last 2 min (`DYNAMIC_WINDOW_S`, at
+  least 1 min of samples, else it keeps what it holds), and its holder lets every unit above
+  `ceil(peak * 1.25)` (at least 1) go at once, so the next admission and every idle listener's gate see them free.
+  A daemon-test admitted at 6 units that runs at 1 core keeps 2. Units only shrink: a job that bursts back above
+  them shares the cores (slower, never failed), and the gate's CPU mark holds new work while the host is busy. No
+  release while host CPU is at 80% or more, under memory pressure, thermally limited, or with many processes in
+  uninterruptible wait (the job record's contended threshold). Signing jobs and a reserving runner's own job keep
+  their admission. RAM chunks are never released early: the floor and the memory-pressure gate stay.
 - A job whose RAM need is more than the host's RAM capacity takes all of it, so it runs only when the host is
   otherwise RAM-idle; it is never refused for RAM. A job waiting for RAM waits as for units (its marker wants
   `units`), so FEED_FIRST, the nightly slot and the signing drain are unchanged.

@@ -65,8 +65,8 @@ An admitted job also gets a detached host sampler (unless --no-telemetry): it re
 this job, by the other runner slots' jobs and by everything outside them, and the top outside processes, and
 writes one "completed" JSON line per job to ~/Library/Logs/glaeda-cmux-jobs.jsonl (glaeda-cmux-job/v1,
 "contended" or "clear"); job-started also writes a "started" line at admission and a "refused" line when it
-refuses. After a warmup, a sustained low-CPU job may release surplus capacity units (and a compile-gui root)
-through its holder; each release is logged as a "capacity_release" line. The existing load gate remains the
+refuses. After a warmup, a job's held units follow its measured cores (LIVE_UNITS): its holder lets the units above
+its recent peak (with a margin) go, and a compile-gui root; each release is logged as a "capacity_release" line. The existing load gate remains the
 safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
 job-completed stops the sampler (it writes the record), starts the same disk pressure pass detached (bounded
@@ -794,6 +794,10 @@ DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 # is the count only where the host cannot be measured (not macOS, sysctl failed). The memory-pressure gate and the
 # disk floor stay. A job whose RAM need is more than the host's RAM capacity takes all of it: it runs only when the
 # host is otherwise RAM-idle, never refused for it.
+#
+# The estimate holds only for a job's start: past DYNAMIC_WARMUP_S its held units follow its measured cores
+# (LIVE_UNITS), so admission and the listener gates count what running jobs use, not their p90 for the whole run.
+# RAM chunks stay held for the whole job.
 JOB_NEEDS_SCHEMA = "glaeda-job-needs/v1"
 JOB_NEEDS_NAME = "glaeda-job-needs.json"
 JOB_NEEDS_ENV = "GLAEDA_JOB_NEEDS"  # another needs file (tests; a host-local trial): a missing path means none
@@ -1297,16 +1301,24 @@ def runner_jobs_in_flight(home: Path, own: Path, table: dict[int, tuple[int, str
     any runner install in home other than own (a job running), and each other install there that listens with no
     Worker and sorts before own (an idle listener that may take a job in the same burst: every idle listener counts
     the ones before it, so a burst of N jobs is admitted only while N jobs' disk is free, not N times one job's)."""
+    running, listening = runner_jobs_in_flight_detail(home, own, table)
+    return len(running) + listening
+
+
+def runner_jobs_in_flight_detail(home: Path, own: Path,
+                                 table: dict[int, tuple[int, str]]) -> tuple[list[tuple[str, int]], int]:
+    """runner_jobs_in_flight's parts: each running job as (its runner install's name, its Runner.Worker pid), and the
+    number of idle pool listeners that sort before own."""
     prefix = r"(?:^|\s)" + re.escape(os.fspath(home)) + r"/(actions-runner[^/\s]*)/bin(?:\.[^/\s]+)?/Runner\."
-    workers, listeners = set(), set()
-    count = 0
-    for _ppid, command in table.values():
+    running: list[tuple[str, int]] = []
+    listeners = set()
+    for pid, (_ppid, command) in table.items():
         if (match := re.search(prefix + r"Worker(?:\s|$)", command)) and match.group(1) != own.name:
-            workers.add(match.group(1))
-            count += 1
+            running.append((match.group(1), pid))
         elif (match := re.search(prefix + r"Listener(?:\s|$)", command)) and match.group(1) != own.name:
             listeners.add(match.group(1))
-    return count + sum(1 for name in listeners - workers if name < own.name and pool_listener(home / name))
+    workers = {name for name, _pid in running}
+    return running, sum(1 for name in listeners - workers if name < own.name and pool_listener(home / name))
 
 
 def pool_listener(runner_dir: Path) -> bool:
@@ -1322,14 +1334,123 @@ def runner_jobs_need_gib(in_flight: int, per_job_gib: float) -> float:
     return round(RUNNER_JOBS_FLOOR_GIB + per_job_gib * (in_flight + 1), 1)
 
 
-def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str) -> str | None:
-    """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None."""
-    need = runner_jobs_need_gib(in_flight, per_job_gib)
+def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str,
+                        written_gib: float = 0.0) -> str | None:
+    """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None.
+    written_gib is what the running jobs have already written of their p95 (RUNNER_JOB_WRITTEN): it is gone from free
+    disk already, so it is not reserved a second time."""
+    need = round(runner_jobs_need_gib(in_flight, per_job_gib) - written_gib, 1)
     if free >= need:
         return None
+    less = (f", less {written_gib:g} GiB the running jobs already wrote (RUNNER_JOB_WRITTEN)"
+            if written_gib > 0 else "")
     return (f"{free:.1f} GiB free, {need:g} GiB required: {RUNNER_JOBS_FLOOR_GIB:g} GiB + {per_job_gib:g} GiB "
-            f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight (or listening first) and this one "
-            f"({RUNNER_JOB_DISK_NAME}: {source})")
+            f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight (or listening first) and this one"
+            f"{less} ({RUNNER_JOB_DISK_NAME}: {source})")
+
+
+# RUNNER_JOB_WRITTEN ("reservation counted twice"; Leo: "disk floors and probes warn, never refuse"). RUNNER_JOBS_DISK
+# charged a running job its full p95 even after it had written that space, so its bytes counted twice: once as gone
+# from free disk, once more as a reservation. 2026-11-17 12:36Z-12:55Z: light minis cmux17, cmux18, cmux19 and cmux21
+# (228 GiB disks resting at 25-35 GiB free, every idle cache already deleted, the space the running jobs' spm-scratch)
+# held side-std listeners for disk while 160 side-std jobs queued and their CPUs ran under 60%. A running job is now
+# charged its remaining growth, max(0, p95 - what it already wrote). Its own sampler measures that, not each gate:
+# at start it reads its runner's _work (du, bounded), and every JOB_WRITTEN_EVERY_S it reads it again together with the
+# owned SwiftPM scratch its packages' .build links point at (readlink only to find them; a root first seen mid-job is
+# measured from then, so it can only read less written). Written is that growth capped by the job's own free-disk
+# drop since admission, so an APFS clone du counts whole (a DerivedData seed) never reads as written. The sampler
+# writes it to JOB_WRITTEN_FILE for its runner; a gate trusts it only for the same live Runner.Worker and while it is
+# fresh. No file, another Worker, a stale or unreadable one: the full p95, as before.
+JOB_WRITTEN_SCHEMA = "glaeda-job-written/v1"
+JOB_WRITTEN_FILE = "job-written-{runner}.json"
+JOB_WRITTEN_EVERY_S = 180.0  # a warm cmux _work's du took 3.1 s on cmux18 (DISK_SHAPE_DU_TIMEOUT_S)
+JOB_WRITTEN_DU_TIMEOUT_S = 15.0
+JOB_WRITTEN_FRESH_S = 3 * JOB_WRITTEN_EVERY_S  # older: the sampler stopped measuring; charge the full p95
+JOB_WRITTEN_MAX_PACKAGES = 64
+
+
+def job_written_file(state_dir: Path, runner_name: str) -> Path:
+    name = "".join(c for c in runner_name if c.isalnum() or c in "-_.")
+    return state_dir / JOB_WRITTEN_FILE.format(runner=name)
+
+
+def job_scratch_roots(workspace: Path) -> list[Path]:
+    """The owned SwiftPM scratch roots (STORE/spm-scratch/<fingerprint>) the job's packages link their .build to
+    (cmux owned_spm_scratch.py link: Packages/*/*/.build), found by readlink alone, never by walking a tree."""
+    roots: list[Path] = []
+    try:
+        for n, build in enumerate(workspace.glob("Packages/*/*/.build")):
+            if n >= JOB_WRITTEN_MAX_PACKAGES:
+                break
+            if not build.is_symlink():
+                continue
+            target = Path(os.readlink(build))
+            root = (target if target.is_absolute() else build.parent / target).parent
+            if root.parent.name == "spm-scratch" and root not in roots:
+                roots.append(root)
+    except OSError:
+        pass
+    return roots
+
+
+class JobWritten:
+    """What one running job has written so far (RUNNER_JOB_WRITTEN): the growth of its runner's _work and of the owned
+    SwiftPM scratch it links, from a baseline taken when each was first seen."""
+
+    def __init__(self, work: Path, workspace: Path | None,
+                 du: Callable[[Path, float], float | None] = work_gib) -> None:
+        self.work, self.workspace, self.du = work, workspace, du
+        self.base: dict[Path, float] = {}
+        start = du(work, JOB_WRITTEN_DU_TIMEOUT_S)
+        if start is not None:
+            self.base[work] = start
+
+    def written(self, free_drop: float | None) -> float | None:
+        """GiB written since the job started, at most its free_drop; None when _work has no baseline or reading."""
+        if self.work not in self.base or free_drop is None:
+            return None
+        for root in job_scratch_roots(self.workspace) if self.workspace is not None else []:
+            if root not in self.base and (size := self.du(root, JOB_WRITTEN_DU_TIMEOUT_S)) is not None:
+                self.base[root] = size  # its baseline is now: anything it wrote before reads as unwritten (safe)
+        total = 0.0
+        for path, base in self.base.items():
+            now = self.du(path, JOB_WRITTEN_DU_TIMEOUT_S)
+            if now is None:
+                if path == self.work:
+                    return None
+                continue  # an unread scratch root counts nothing written: the safe side
+            total += max(0.0, now - base)
+        return round(max(0.0, min(total, free_drop)), 2)
+
+
+def write_job_written(state_dir: Path, runner_name: str, worker_pid: int, written: float, now: float) -> None:
+    path = job_written_file(state_dir, runner_name)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps({"schema": JOB_WRITTEN_SCHEMA, "worker_pid": worker_pid, "written_gib": written,
+                               "at": round(now, 1)}))
+    os.replace(tmp, path)
+
+
+def job_written_gib(state_dir: Path, runner_name: str, worker_pid: int, now: float | None = None) -> float | None:
+    """What the job of runner_name's Runner.Worker worker_pid has written (RUNNER_JOB_WRITTEN), or None (unmeasured:
+    no file, another Worker's, stale or malformed)."""
+    try:
+        raw = read_bounded(job_written_file(state_dir, runner_name), 4096)
+        if raw is None:
+            return None
+        doc = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != JOB_WRITTEN_SCHEMA or doc.get("worker_pid") != worker_pid:
+        return None
+    at, written = doc.get("at"), doc.get("written_gib")
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (at, written)):
+        return None
+    age = (time.time() if now is None else now) - at
+    if not -5 <= age <= JOB_WRITTEN_FRESH_S or written < 0:
+        return None
+    return float(written)
 
 
 # LABEL_DISK: `label-disk-samples` reads each label's measured job disk growth on a mini, `label-disk-table` pools the
@@ -2402,6 +2523,19 @@ SATURATED = "the mini is saturated"
 # load again once the load has fallen below the resume mark, so one stuck process cannot keep a mini dark.
 GATE_LOAD_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_MAX_HOLD_S") or 30 * 60)
 GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
+# A listener that acknowledged a job request and has started no Runner.Worker for this long is stuck, not taking it:
+# the gate restarts it (Gate.stuck_acquire). cmux13s glaeda-12, 2026-11-17: acknowledged f233fe94 at 08:02:33Z, then
+# GetJobMessageAsync hung on one connection with no further _diag line until 12:40:14Z, so the slot ran nothing for
+# 4.6 h while stop() kept it as "taking job request". The bound, from every acknowledge in the _diag logs of
+# cmux13s, cmux10s and cmuxs-mac-mini-5 (29,427, 2026-10-19..11-17): acknowledge to Worker p50 2 s, p99 14 s, max
+# 219 s; an acknowledge that ended without a Worker on its own did so within 678 s. GitHub fails a job its runner has
+# not acquired and renewed for 10 min ("lost communication with the server", LISTENER_TAKES' note), so past 15 min
+# the restart can lose nothing the hang had not already lost. A Runner.Worker is never touched.
+GATE_ACQUIRE_STUCK_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ACQUIRE_STUCK_S") or 15 * 60)
+GATE_ACQUIRE_EVERY_S = 30.0  # how often a busy listener with no Worker is looked at for it
+LISTENER_STUCK = "listener_acquire_stuck"  # the structured reason, in the log line and in GATE_RESTARTS_FILE
+GATE_RESTARTS_FILE = "listener-restarts.jsonl"  # in the state dir; glaeda-mini-health reports it as healed
+GATE_RESTARTS_KEEP = 200
 # A listener's first message poll is kept this long before a hold may stop it. GitHub can hand a queued job to a
 # new session before the listener has seen it, and a stop that cancels that poll loses the job: GitHub retries the
 # gone session and fails the job 3 min later, "not acquired by Runner of type self-hosted even after multiple
@@ -8565,25 +8699,57 @@ def listener_request(runner_dir: Path) -> str | None:
     """The runner request the listener has acknowledged or dispatched and not yet finished, from the tail of the
     newest _diag/Runner_*.log (a listener writes a new one each start; Worker_*.log files are jobs' own), or None.
     From the acknowledge until its Worker finishes the job is this runner's: a stop in that span loses it."""
+    return listener_request_at(runner_dir)[0]
+
+
+DIAG_STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)Z ")
+
+
+def listener_request_at(runner_dir: Path) -> tuple[str | None, float | None]:
+    """listener_request, with when the listener took it: the epoch of its acknowledge's _diag line (UTC), or None
+    when that line has no stamp."""
     diag = runner_dir / "_diag"
     try:
         names = sorted(n for n in os.listdir(diag) if n.startswith("Runner_") and n.endswith(".log"))
     except FileNotFoundError:
-        return None
+        return None, None
     if not names:
-        return None
+        return None, None
     with open(diag / names[-1], "rb") as file:
         size = os.fstat(file.fileno()).st_size
         file.seek(max(0, size - RUNNER_DIAG_TAIL))
         text = file.read().decode("utf-8", "replace")
-    request = None
+    request, at = None, None
     for line in text.splitlines():
         taken = LISTENER_TAKES.search(line)
         if taken:
+            if request is None or taken.group(1):  # an acknowledge starts the span; its dispatch keeps the stamp
+                stamp = DIAG_STAMP.match(line)
+                at = None
+                if stamp:
+                    with contextlib.suppress(ValueError):
+                        at = datetime.datetime.strptime(stamp.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                            tzinfo=datetime.timezone.utc).timestamp()
             request = taken.group(1) or taken.group(2)
         elif request is not None and any(done in line for done in LISTENER_DONE):
-            request = None
-    return request
+            request, at = None, None
+    return request, at
+
+
+def note_listener_restart(state_dir: Path, runner_dir: Path, doc: dict[str, Any]) -> None:
+    """Append one gate restart of a stuck listener to GATE_RESTARTS_FILE (the last GATE_RESTARTS_KEEP kept), which
+    glaeda-mini-health reports under healed for ci-dash. A failed write changes nothing the gate does."""
+    path = state_dir / GATE_RESTARTS_FILE
+    line = json.dumps({"runner": runner_dir.name, **doc}, separators=(",", ":"), sort_keys=True)
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            kept = path.read_text(encoding="utf-8").splitlines()[-(GATE_RESTARTS_KEEP - 1):]
+        except FileNotFoundError:
+            kept = []
+        tmp = path.with_name(path.name + f".{os.getpid()}")
+        tmp.write_text("".join(f"{x}\n" for x in [*kept, line] if x.strip()), encoding="utf-8")
+        os.replace(tmp, path)
 
 
 # A runner GitHub removed (an org deletes a runner that has not connected for a while, so a listener the gate held
@@ -8716,6 +8882,12 @@ class Gate:
         self.waiter_seen = waiter_seen_stamp(state_dir)  # the last job-started waiter refusal this gate acted on
         self.worker_noted = False
         self.defer_noted = False  # stop() said once that it kept a listener taking a job
+        # stuck_acquire(): a request the listener acknowledged and never ran (GATE_ACQUIRE_STUCK_S) is given up, so
+        # busy() and stop() no longer keep the listener for it; first_taken is when this gate first saw the request
+        # without a Worker (time.monotonic), the bound when its _diag line has no stamp
+        self.lost_request: str | None = None
+        self.first_taken: tuple[str, float] | None = None
+        self.acquire_at = -GATE_ACQUIRE_EVERY_S
         self.source = source_identity()
         self.thermal: int | None = None  # the level while the gate holds for heat, else None
         self.thermal_at = -GATE_THERMAL_EVERY_S
@@ -9434,11 +9606,16 @@ class Gate:
         if free >= runner_jobs_need_gib(max(0, len(runner_dirs(home)) - 1), per):
             return None
         try:
-            in_flight = runner_jobs_in_flight(home, self.runner_dir, processes())
+            running, listening = runner_jobs_in_flight_detail(home, self.runner_dir, processes())
         except Exception:  # noqa: BLE001
             return None
-        why = runner_jobs_refusal(free, in_flight, per, source)
-        return (why, runner_jobs_need_gib(in_flight, per)) if why else None
+        # RUNNER_JOB_WRITTEN: a running job is charged only what it has still to write of its p95
+        now = time.time()
+        written = round(sum(min(per, job_written_gib(self.state_dir, name, pid, now) or 0.0)
+                            for name, pid in running), 1)
+        in_flight = len(running) + listening
+        why = runner_jobs_refusal(free, in_flight, per, source, written)
+        return (why, round(runner_jobs_need_gib(in_flight, per) - written, 1)) if why else None
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
         """Below a builder's floor or reserve, reclaim idle PR runners' _work in a bounded thread
@@ -9866,7 +10043,7 @@ class Gate:
         if not self.listening():
             return False
         request = self.taking()
-        return request is not None and (finished is None or request != finished)
+        return request is not None and request != self.lost_request and (finished is None or request != finished)
 
     def listening(self) -> bool:
         """A Runner.Listener of this runner under its tree. A failed look counts as listening."""
@@ -9912,6 +10089,55 @@ class Gate:
         except (OSError, ValueError) as error:
             return f"unknown ({type(error).__name__})"
 
+    def stuck_acquire(self, now: float | None = None) -> bool:
+        """A listener that acknowledged a job request GATE_ACQUIRE_STUCK_S ago and has started no Runner.Worker
+        for it is stuck in its acquisition, not taking a job (GATE_ACQUIRE_STUCK_S): give the request up (lost_request,
+        so busy() and stop() no longer keep the listener for it) and restart the listener through stop(): its SIGINT,
+        the kill after GATE_STOP_WAIT_S, then the usual start after GATE_RESTART_FREE_S free. Logged with
+        LISTENER_STUCK and counted in GATE_RESTARTS_FILE. Looked at every GATE_ACQUIRE_EVERY_S; a Worker, or an
+        unreadable diag or process table, is never stuck. Returns whether it stopped the listener."""
+        mono = time.monotonic()
+        if self.stop_deadline is not None or self.terminating or mono - self.acquire_at < GATE_ACQUIRE_EVERY_S:
+            return False
+        self.acquire_at = mono
+        # the diag first: an idle listener (no request) costs no process-table read, and the gate's own reads of
+        # the table (busy(), the reserve lend) see the same sequence they did before this check existed
+        try:
+            request, acked = listener_request_at(self.runner_dir)
+        except (OSError, ValueError):
+            return False
+        if request is None or request == self.lost_request:
+            self.first_taken = None
+            return False
+        if self.worker() or not self.listening():  # a failed look reads as a Worker: never stuck
+            self.first_taken = None
+            return False
+        if self.first_taken is None or self.first_taken[0] != request:
+            self.first_taken = (request, mono)
+        now = time.time() if now is None else now
+        held = mono - self.first_taken[1]
+        if acked is not None:  # an acknowledge never predates its own listener (listening_since, when known)
+            age = now - acked
+            if self.listening_since is not None:
+                age = min(age, mono - self.listening_since)
+            held = max(held, age)
+        if held < GATE_ACQUIRE_STUCK_S:
+            return False
+        why = (f"{LISTENER_STUCK}: the listener acknowledged job request {request} "
+               f"{'at ' + gate_stamp(acked) + ' ' if acked is not None else ''}and started no Runner.Worker in "
+               f"{held:.0f} s (bound {GATE_ACQUIRE_STUCK_S:g} s); restarting it")
+        self.lost_request = request
+        gate_log(why)
+        self.unclaim()
+        if not self.stop(why):  # a Worker came up at the last look: it is a job after all
+            self.lost_request = None
+            return False
+        note_listener_restart(self.state_dir, self.runner_dir, {
+            "schema": 1, "cause": LISTENER_STUCK, "t": round(now), "at": gate_stamp(now), "request": request,
+            "acknowledged": gate_stamp(acked) if acked is not None else None, "held_s": round(held),
+            "bound_s": GATE_ACQUIRE_STUCK_S})
+        return True
+
     def start(self) -> None:
         gate_log("starting the listener")
         self.child = subprocess.Popen([os.fspath(self.runner_dir / "run.sh")], cwd=self.runner_dir,
@@ -9919,6 +10145,7 @@ class Gate:
         self.stale_env = None
         self.streak, self.stopped_one = 0, False
         self.listening_since, self.first_poll_noted = time.monotonic(), False
+        self.lost_request, self.first_taken = None, None
         self.started_wall = time.time()
 
     def registration_wait(self) -> bool:
@@ -10005,7 +10232,7 @@ class Gate:
                     frozen.append(pid)
             if listeners:
                 request, worker = self.taking(), self.worker()
-                if request is not None and request == finished and not worker:
+                if request is not None and request in (finished, self.lost_request) and not worker:
                     request = None
                 if (worker and not self.terminating) or (request is not None and not worker):
                     if not self.defer_noted:
@@ -10130,6 +10357,8 @@ class Gate:
                     self.stop(why, finished)
                     return None
             self.reload()
+            if self.stuck_acquire():
+                return None
             if self.busy():
                 # A fleet build seen waiting, or a reservation made, during a job stops the listener as the job
                 # ends: with a queue behind the label the next job comes before two idle polls, and each is
@@ -10404,10 +10633,24 @@ WARM_START_MAX_BYTES = 4 * 1024
 WARM_START_STATES = ("warm", "seeded", "cold")
 SAMPLE_S = 10.0
 THERMAL_EVERY = 6  # pmset -g therm every Nth sample
+# LIVE_UNITS (Leo, 2026-11-17: "maximizing the amount of time that we're using our stuff"; and while jobs queue every
+# mini runs above 80% CPU and RAM). A job is admitted at its estimate (ceil(cores_p90), CAPACITY_ARITHMETIC) and for
+# its first DYNAMIC_WARMUP_S keeps all of it. After that its sampler sizes what it holds by what it uses: the peak of
+# its tree's measured cores over the last DYNAMIC_WINDOW_S (at least DYNAMIC_LOW_S of samples, else it keeps what it
+# holds), times DYNAMIC_MARGIN, rounded up, at least 1; its holder lets the units above that go at once, so the ledger
+# that admission and every listener gate read (take_capacity, mini_full) tracks live use. Before this the release
+# needed no process at all in uninterruptible wait (an idle Mac shows 1 to 3, so it never fired) and kept half the
+# admission: on 2026-11-17 13:15Z a daemon-test held 5-6 units of a 14-core mini at about 1 core while side-std
+# listeners sat on "capacity in use" at 28-50% host CPU, 170 jobs queued. Units only shrink: a job that bursts back
+# above them shares the mini's cores (slower, never failed), and the listener gate's CPU mark (GATE_CPU_PAUSE) holds
+# new work while the host is busy. No release while the host is at DYNAMIC_TARGET_BUSY_PCT, under memory pressure,
+# thermally limited or contended on uninterruptible waits (CONTENDED_BLOCKED). RAM chunks are never released early:
+# the RAM side keeps its floor (mem_floor_mib) and the memory-pressure gate.
 DYNAMIC_WARMUP_S = float(os.environ.get("GLAEDA_DYNAMIC_WARMUP_S") or 120.0)
 DYNAMIC_LOW_S = float(os.environ.get("GLAEDA_DYNAMIC_LOW_S") or 60.0)
+DYNAMIC_WINDOW_S = float(os.environ.get("GLAEDA_DYNAMIC_WINDOW_S") or 120.0)
 DYNAMIC_TARGET_BUSY_PCT = 80.0
-DYNAMIC_LOW_JOB_SHARE = 0.60
+DYNAMIC_MARGIN = 1.25
 MEMORY_PRESSURE_KEY = "kern.memorystatus_vm_pressure_level"
 PS = "/bin/ps"
 SYSCTL = "/usr/sbin/sysctl"
@@ -10905,25 +11148,38 @@ def swap_usage() -> tuple[int, int] | None:
     return parse_swap_usage(out)
 
 
-def dynamic_release_decision(elapsed: float, low_since: float | None, units: int, total: int,
-                             job_cores: float | None, host_busy: float | None, blocked: int,
-                             memory: int | None, thermal: bool | None,
-                             admitted: int | None = None) -> tuple[int, str] | None:
-    """Pure safety decision: release one unit only after warmup and sustained low, safe headroom. A job keeps at
-    least half the units it was admitted with (rounded up): units are its estimated cores, and a 6-core job quiet
-    through a slow checkout or cache fetch must not drop to one core and then compile on cores others were given."""
-    floor = max(1, math.ceil(admitted / 2)) if admitted else 1
-    if units <= floor or total <= 1 or elapsed < DYNAMIC_WARMUP_S or low_since is None:
+def live_peak(window: list[tuple[float, float]], now: float) -> tuple[float | None, float]:
+    """(the peak cores of the samples in the last DYNAMIC_WINDOW_S, the seconds they cover); (None, 0) with none.
+    Prunes older samples from `window` ((monotonic time, job cores), oldest first) in place."""
+    while window and window[0][0] < now - DYNAMIC_WINDOW_S:
+        window.pop(0)
+    if not window:
+        return None, 0.0
+    return max(cores for _, cores in window), now - window[0][0]
+
+
+def blocked_contended(blocked: int, ncpu: int) -> bool:
+    """Many processes in uninterruptible wait (the job record's contended reason): an idle Mac shows 1 to 3."""
+    return blocked >= max(CONTENDED_BLOCKED, CONTENDED_BLOCKED_SHARE * max(1, ncpu))
+
+
+def dynamic_release_decision(elapsed: float, peak: float | None, covered: float, units: int, total: int,
+                             host_busy: float | None, blocked: int, memory: int | None, thermal: bool | None,
+                             ncpu: int = 1, warmup: float | None = None) -> tuple[int, str] | None:
+    """LIVE_UNITS: the units this job keeps, sized by its measured peak cores, and why; None keeps what it holds. A job
+    with no measurement covering DYNAMIC_LOW_S (ps failing, just started) keeps its admission (its p90)."""
+    if units <= 1 or total <= 1 or elapsed < (DYNAMIC_WARMUP_S if warmup is None else warmup):
         return None
-    if elapsed - low_since < DYNAMIC_LOW_S or job_cores is None:
-        return None
-    if job_cores > max(0.5, units * DYNAMIC_LOW_JOB_SHARE):
+    if peak is None or not math.isfinite(peak) or peak < 0 or covered < DYNAMIC_LOW_S:
         return None
     if host_busy is not None and host_busy >= DYNAMIC_TARGET_BUSY_PCT:
         return None
-    if blocked > 0 or (memory is not None and memory >= 2) or thermal:
+    if blocked_contended(blocked, ncpu) or (memory is not None and memory >= 2) or thermal:
         return None
-    return units - 1, "sustained low job CPU with host headroom"
+    keep = max(1, math.ceil(peak * DYNAMIC_MARGIN - 1e-9))
+    if keep >= units:
+        return None
+    return keep, f"measured {peak:.2f} cores peak over {covered:.0f} s (x{DYNAMIC_MARGIN}: {keep} units)"
 
 
 def request_dynamic_release(state_dir: Path, keep_units: int, details: dict[str, Any]) -> None:
@@ -11248,8 +11504,10 @@ def job_event(event: str, meta: dict[str, Any], log: Path = JOB_LOG, **fields: A
 
 
 def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Path = JOB_LOG,
-                  interval: float = SAMPLE_S, disk_path: str | None = None) -> str:
-    """Fork the detached sampler. Best effort: returns a note, never raises, never fails the job."""
+                  interval: float = SAMPLE_S, disk_path: str | None = None, workspace: str | None = None) -> str:
+    """Fork the detached sampler. Best effort: returns a note, never raises, never fails the job. With workspace
+    (GITHUB_WORKSPACE, <runner>/_work/<repo>/<repo>) and disk_path it also reports what the job has written
+    (RUNNER_JOB_WRITTEN)."""
     try:
         pid_file = sampler_file(state_dir)
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -11274,12 +11532,18 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
         if disk_path:
             samples.disk_free_start = free_or_none(disk_path)
+        written = None  # RUNNER_JOB_WRITTEN: (the runner's name, the job's JobWritten)
+        with contextlib.suppress(Exception):
+            ws = Path(workspace) if workspace else None
+            if disk_path and ws is not None and ws.parent.parent.name == "_work":
+                written = (ws.parent.parent.parent.name, JobWritten(ws.parent.parent, ws))
+        written_at = time.monotonic()
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
         dynamic_units = admitted_units = int(meta.get("units") or 0)
         dynamic_total = int(meta.get("units_total") or dynamic_units)
         dynamic_warmup = DYNAMIC_WARMUP_S + (300.0 if meta.get("class") == "compile-gui" else 0.0)
-        low_since: float | None = None
+        live: list[tuple[float, float]] = []  # LIVE_UNITS: (monotonic time, the job tree's cores), oldest first
         # what the job holds, read only while its Runner.Worker lives: job-completed removes .roots and .gui
         # after finish_sampler's short wait, and once the worker is gone the next job on this runner rewrites them
         holdings = (list(meta.get("roots") or []), bool(meta.get("gui")))
@@ -11304,32 +11568,32 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 if dynamic_units > 1 and dynamic_total > 1 and meta.get("class") != EXCLUSIVE_CLASS:
                     now = time.monotonic()
                     job_cores = split[0]
+                    live.append((now, job_cores))
+                    peak, covered = live_peak(live, now)
                     host_busy = disk_busy[1]
                     blocked = queue[1] if queue is not None else 0
                     memory = memory_pressure_level()
                     thermal = samples.thermal is True
-                    quiet = (now - started_mono >= dynamic_warmup
-                             and job_cores <= max(0.5, dynamic_units * DYNAMIC_LOW_JOB_SHARE)
-                             and (host_busy is None or host_busy < DYNAMIC_TARGET_BUSY_PCT)
-                             and blocked == 0 and (memory is None or memory < 2) and not thermal)
-                    low_since = now if quiet and low_since is None else (low_since if quiet else None)
-                    decision = dynamic_release_decision(now - started_mono, low_since, dynamic_units, dynamic_total,
-                                                        job_cores, host_busy, blocked, memory, thermal,
-                                                        admitted=admitted_units)
+                    decision = dynamic_release_decision(now - started_mono, peak, covered, dynamic_units,
+                                                        dynamic_total, host_busy, blocked, memory, thermal,
+                                                        ncpu=samples.ncpu, warmup=dynamic_warmup)
                     if decision:
                         keep, release_reason = decision
                         request_dynamic_release(state_dir, keep, {"reason": release_reason,
                                                                  "release_root": meta.get("class") == "compile-gui"})
                         job_event("capacity_release", meta, log, units_before=dynamic_units,
-                                  units_after=keep, job_cores=round(job_cores, 2),
-                                  host_cpu_busy_pct=host_busy, memory_pressure=memory,
-                                  blocked=blocked, reason=release_reason)
+                                  units_after=keep, units_admitted=admitted_units, job_cores=round(job_cores, 2),
+                                  peak_cores=round(peak or 0.0, 2), host_cpu_busy_pct=host_busy,
+                                  memory_pressure=memory, blocked=blocked, reason=release_reason)
                         dynamic_units = keep
-                        low_since = None
                 if tick % THERMAL_EVERY == 0:
                     limited = thermal_limited()
                     if limited is not None:
                         samples.thermal = bool(samples.thermal) or limited
+                if written is not None and time.monotonic() - written_at >= JOB_WRITTEN_EVERY_S:
+                    written_at = time.monotonic()
+                    report_job_written(written[1], state_dir, written[0], watch_pid, disk_path,
+                                       samples.disk_free_start)
             except Exception:  # noqa: BLE001  (a bad sample is skipped, not fatal)
                 pass
             tick += 1
@@ -11360,6 +11624,9 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 time.sleep(min(1.0, left))
             if finished:
                 break
+        if written is not None:
+            with contextlib.suppress(OSError):
+                job_written_file(state_dir, written[0]).unlink()
         if disk_path:
             samples.disk_free_end = free_or_none(disk_path)
         record = samples.summary(time.time())
@@ -11382,6 +11649,21 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             if pid_file.read_text().strip() == str(os.getpid()):
                 pid_file.unlink()
         os._exit(0)
+
+
+def report_job_written(tracker: JobWritten, state_dir: Path, runner_name: str, worker_pid: int,
+                       disk_path: str | None, free_start: float | None) -> float | None:
+    """RUNNER_JOB_WRITTEN: measure what the job has written (capped by its free-disk drop since admission) and write
+    it for the other runners' gates; unmeasured, the file is removed, so they charge the full p95."""
+    free = free_or_none(disk_path) if disk_path else None
+    drop = None if free is None or free_start is None else free_start - free
+    value = tracker.written(drop)
+    if value is None:
+        with contextlib.suppress(OSError):
+            job_written_file(state_dir, runner_name).unlink()
+        return None
+    write_job_written(state_dir, runner_name, worker_pid, value, time.time())
+    return value
 
 
 def finish_sampler(state_dir: Path, wait_s: float = 5.0) -> str:
@@ -12852,7 +13134,8 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:  # noqa: BLE001
                 pass
             note = start_sampler(owner.pid, args.state_dir, meta, args.job_log,
-                                 disk_path=None if args.no_disk else disk_path)
+                                 disk_path=None if args.no_disk else disk_path,
+                                 workspace=os.environ.get("GITHUB_WORKSPACE"))
             print(f"{PREFIX}: {note}", flush=True)
     else:
         if telemetry:

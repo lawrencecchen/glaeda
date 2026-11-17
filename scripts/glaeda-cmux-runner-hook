@@ -1361,8 +1361,21 @@ def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source:
 # drop since admission, so an APFS clone du counts whole (a DerivedData seed) never reads as written. The sampler
 # writes it to JOB_WRITTEN_FILE for its runner; a gate trusts it only for the same live Runner.Worker and while it is
 # fresh. No file, another Worker, a stale or unreadable one: the full p95, as before.
-JOB_WRITTEN_SCHEMA = "glaeda-job-written/v1"
-JOB_WRITTEN_FILE = "job-written-{runner}.json"
+# The pid and freshness alone do not name a job: an earlier job's record (its sampler late, its cleanup missed) whose
+# pid the next job's Runner.Worker reuses read as the next job's, and the earlier job's cleanup deleted the next job's
+# record. So job-started draws a per-job nonce into JOB_NONCE_FILE (with its Worker's pid); the sampler writes it with
+# every record and only while it is still the runner's current nonce, removes a record only when it carries its own
+# nonce, and a gate trusts a record only when its nonce is the runner's current one for that Worker.
+# A record discounts disk the gate then admits work against, and a job runs as the hook's user with the state
+# directory in its reach. So both files live in the hook's private JOB_WRITTEN_DIR (0700, its uid's), are written
+# 0600 without following a symlink, and are read only as a regular file of the gate's uid with no group or other
+# access, in that directory as such; cleanup removes only a record that passes the same checks and carries its
+# job's nonce. A file in the state directory itself (where earlier hooks wrote it) is never read.
+JOB_WRITTEN_SCHEMA = "glaeda-job-written/v2"  # v1 had no nonce: a gate reads it as unmeasured (the full p95)
+JOB_WRITTEN_DIR = "job-written"
+JOB_WRITTEN_FILE = "written-{runner}.json"
+JOB_NONCE_SCHEMA = "glaeda-job-nonce/v1"
+JOB_NONCE_FILE = "nonce-{runner}.json"
 JOB_WRITTEN_EVERY_S = 180.0  # a warm cmux _work's du took 3.1 s on cmux18 (DISK_SHAPE_DU_TIMEOUT_S)
 JOB_WRITTEN_DU_TIMEOUT_S = 15.0
 JOB_WRITTEN_FRESH_S = 3 * JOB_WRITTEN_EVERY_S  # older: the sampler stopped measuring; charge the full p95
@@ -1371,7 +1384,7 @@ JOB_WRITTEN_MAX_PACKAGES = 64
 
 def job_written_file(state_dir: Path, runner_name: str) -> Path:
     name = "".join(c for c in runner_name if c.isalnum() or c in "-_.")
-    return state_dir / JOB_WRITTEN_FILE.format(runner=name)
+    return state_dir / JOB_WRITTEN_DIR / JOB_WRITTEN_FILE.format(runner=name)
 
 
 def job_scratch_roots(workspace: Path) -> list[Path]:
@@ -1423,26 +1436,154 @@ class JobWritten:
         return round(max(0.0, min(total, free_drop)), 2)
 
 
-def write_job_written(state_dir: Path, runner_name: str, worker_pid: int, written: float, now: float) -> None:
-    path = job_written_file(state_dir, runner_name)
+def job_nonce_file(state_dir: Path, runner_name: str) -> Path:
+    name = "".join(c for c in runner_name if c.isalnum() or c in "-_.")
+    return state_dir / JOB_WRITTEN_DIR / JOB_NONCE_FILE.format(runner=name)
+
+
+def private_to_me(st: os.stat_result) -> bool:
+    """The gate's own uid's, with no group or other access."""
+    return st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) & 0o077 == 0
+
+
+def private_dir(path: Path) -> bool:
+    """path is a directory (not a symlink to one) of the gate's uid with no group or other access."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and private_to_me(st)
+
+
+def read_job_doc(path: Path, schema: str) -> dict[str, Any] | None:
+    """A job-written or job-nonce record, or None: missing, unreadable, malformed, of another schema, or not the
+    hook's own (its directory or the file not private to the gate's uid, or a symlink)."""
+    if not private_dir(path.parent):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or not private_to_me(st):
+            return None
+        doc = json.loads(os.read(fd, 4096).decode("utf-8")) if st.st_size <= 4096 else None
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    finally:
+        os.close(fd)
+    return doc if isinstance(doc, dict) and doc.get("schema") == schema else None
+
+
+def ensure_job_dir(directory: Path) -> None:
+    """Make the hook's private JOB_WRITTEN_DIR (0700); OSError when it is not the gate's own directory."""
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(directory, 0o700)
+    st = os.lstat(directory)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(errno.EPERM, "not the hook's own job-written directory", os.fspath(directory))
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(directory, 0o700)  # lstat above: a real directory, not a symlink
+
+
+@contextlib.contextmanager
+def job_written_lock(state_dir: Path, runner_name: str):
+    """One runner's begin, write and clear as one step each (an exclusive flock of its .lock in JOB_WRITTEN_DIR), so
+    a late sampler's check-then-remove never removes the next job's nonce or record drawn in between."""
+    directory = job_nonce_file(state_dir, runner_name).parent
+    ensure_job_dir(directory)
+    name = "".join(c for c in runner_name if c.isalnum() or c in "-_.")
+    fd = os.open(directory / f".{name}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def write_job_doc(path: Path, doc: dict[str, Any]) -> None:
+    """Write doc to path in the hook's private JOB_WRITTEN_DIR, 0600 and never through a symlink, atomically."""
+    ensure_job_dir(path.parent)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
-    state_dir.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps({"schema": JOB_WRITTEN_SCHEMA, "worker_pid": worker_pid, "written_gib": written,
-                               "at": round(now, 1)}))
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, json.dumps(doc).encode())
+    finally:
+        os.close(fd)
     os.replace(tmp, path)
+
+
+def begin_job_written(state_dir: Path, runner_name: str, worker_pid: int) -> str | None:
+    """job-started: draw this job's nonce and name it, with its Runner.Worker's pid and start identity
+    (process_identity), the runner's current job. Every record and cleanup of the job carries it, so an earlier job's
+    record is never this one's. None when it cannot be written: the job is then unmeasured (the full p95)."""
+    path = job_nonce_file(state_dir, runner_name)
+    nonce = os.urandom(16).hex()
+    try:
+        with job_written_lock(state_dir, runner_name):
+            path.unlink(missing_ok=True)  # a new nonce that cannot be written leaves no earlier job's in place
+            identity = process_identity(worker_pid)
+            if identity is None:
+                return None
+            write_job_doc(path, {"schema": JOB_NONCE_SCHEMA, "nonce": nonce, "worker_pid": worker_pid,
+                                 "worker_identity": identity})
+    except OSError:
+        return None
+    return nonce
+
+
+def current_job_nonce(state_dir: Path, runner_name: str, worker_pid: int | None = None) -> str | None:
+    """The nonce job-started drew for runner_name's current job; with worker_pid, only while that pid is still the
+    same Runner.Worker process (its start identity unchanged: a pid reused before the next job-started is not)."""
+    doc = read_job_doc(job_nonce_file(state_dir, runner_name), JOB_NONCE_SCHEMA)
+    if doc is None:
+        return None
+    if worker_pid is not None:
+        identity = doc.get("worker_identity")
+        if doc.get("worker_pid") != worker_pid or not isinstance(identity, str) \
+                or process_identity(worker_pid) != identity:
+            return None
+    nonce = doc.get("nonce")
+    return nonce if isinstance(nonce, str) and nonce else None
+
+
+def write_job_written(state_dir: Path, runner_name: str, worker_pid: int, nonce: str, written: float,
+                      now: float) -> bool:
+    """Write what the job with this nonce has written, only while it is still the runner's current job: a sampler
+    that outlived its job writes nothing over the next job's record. True when written."""
+    with job_written_lock(state_dir, runner_name):
+        if current_job_nonce(state_dir, runner_name) != nonce:
+            return False
+        write_job_doc(job_written_file(state_dir, runner_name),
+                      {"schema": JOB_WRITTEN_SCHEMA, "worker_pid": worker_pid, "nonce": nonce,
+                       "written_gib": written, "at": round(now, 1)})
+    return True
+
+
+def clear_job_written(state_dir: Path, runner_name: str, nonce: str, job_ended: bool = False) -> None:
+    """Remove the runner's job-written record only when it is the hook's own (read_job_doc: private to the gate's uid,
+    no symlink) and the record of the job with this nonce, never by pid, under the runner's lock. job_ended also
+    removes the runner's current-job nonce when it is still this job's, so between jobs no record is trusted."""
+    paths = [(job_written_file(state_dir, runner_name), JOB_WRITTEN_SCHEMA)]
+    if job_ended:
+        paths.append((job_nonce_file(state_dir, runner_name), JOB_NONCE_SCHEMA))
+    with contextlib.suppress(OSError), job_written_lock(state_dir, runner_name):
+        for path, schema in paths:
+            doc = read_job_doc(path, schema)
+            if doc is not None and doc.get("nonce") == nonce:
+                path.unlink()
 
 
 def job_written_gib(state_dir: Path, runner_name: str, worker_pid: int, now: float | None = None) -> float | None:
     """What the job of runner_name's Runner.Worker worker_pid has written (RUNNER_JOB_WRITTEN), or None (unmeasured:
-    no file, another Worker's, stale or malformed)."""
-    try:
-        raw = read_bounded(job_written_file(state_dir, runner_name), 4096)
-        if raw is None:
-            return None
-        doc = json.loads(raw)
-    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
-        return None
-    if not isinstance(doc, dict) or doc.get("schema") != JOB_WRITTEN_SCHEMA or doc.get("worker_pid") != worker_pid:
+    no file, another job's nonce, another Worker's, stale or malformed)."""
+    nonce = current_job_nonce(state_dir, runner_name, worker_pid)
+    doc = read_job_doc(job_written_file(state_dir, runner_name), JOB_WRITTEN_SCHEMA)
+    if nonce is None or doc is None or doc.get("nonce") != nonce or doc.get("worker_pid") != worker_pid:
         return None
     at, written = doc.get("at"), doc.get("written_gib")
     if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (at, written)):
@@ -8774,18 +8915,25 @@ def listener_request_at(runner_dir: Path) -> tuple[str | None, float | None]:
 
 def note_listener_restart(state_dir: Path, runner_dir: Path, doc: dict[str, Any]) -> None:
     """Append one gate restart of a stuck listener to GATE_RESTARTS_FILE (the last GATE_RESTARTS_KEEP kept), which
-    glaeda-mini-health reports under healed for ci-dash. A failed write changes nothing the gate does."""
+    glaeda-mini-health reports under healed for ci-dash. A failed write changes nothing the gate does. Every runner's
+    gate writes the one file, so the read, trim and replace is one step under an exclusive flock of its .lock (two
+    gates noting at once kept only one line)."""
     path = state_dir / GATE_RESTARTS_FILE
     line = json.dumps({"runner": runner_dir.name, **doc}, separators=(",", ":"), sort_keys=True)
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
+        lock = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
-            kept = path.read_text(encoding="utf-8").splitlines()[-(GATE_RESTARTS_KEEP - 1):]
-        except FileNotFoundError:
-            kept = []
-        tmp = path.with_name(path.name + f".{os.getpid()}")
-        tmp.write_text("".join(f"{x}\n" for x in [*kept, line] if x.strip()), encoding="utf-8")
-        os.replace(tmp, path)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                kept = path.read_text(encoding="utf-8").splitlines()[-(GATE_RESTARTS_KEEP - 1):]
+            except FileNotFoundError:
+                kept = []
+            tmp = path.with_name(path.name + f".{os.getpid()}")
+            tmp.write_text("".join(f"{x}\n" for x in [*kept, line] if x.strip()), encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            os.close(lock)
 
 
 # A runner GitHub removed (an org deletes a runner that has not connected for a while, so a listener the gate held
@@ -11548,6 +11696,11 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         pid_file = sampler_file(state_dir)
         state_dir.mkdir(parents=True, exist_ok=True)
         pid_file.unlink(missing_ok=True)
+        nonce = None  # RUNNER_JOB_WRITTEN: this job's nonce, drawn before job-started returns
+        with contextlib.suppress(Exception):
+            ws = Path(workspace) if workspace else None
+            if disk_path and ws is not None and ws.parent.parent.name == "_work":
+                nonce = begin_job_written(state_dir, ws.parent.parent.parent.name, watch_pid)
         child = os.fork()
     except Exception as error:  # noqa: BLE001  (observation must not refuse a job)
         return f"job telemetry off ({type(error).__name__})"
@@ -11568,11 +11721,10 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
         if disk_path:
             samples.disk_free_start = free_or_none(disk_path)
-        written = None  # RUNNER_JOB_WRITTEN: (the runner's name, the job's JobWritten)
+        written = None  # RUNNER_JOB_WRITTEN: (the runner's name, the job's JobWritten, its nonce)
         with contextlib.suppress(Exception):
-            ws = Path(workspace) if workspace else None
-            if disk_path and ws is not None and ws.parent.parent.name == "_work":
-                written = (ws.parent.parent.parent.name, JobWritten(ws.parent.parent, ws))
+            if nonce is not None and ws is not None:
+                written = (ws.parent.parent.parent.name, JobWritten(ws.parent.parent, ws), nonce)
         written_at = time.monotonic()
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
@@ -11628,7 +11780,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                         samples.thermal = bool(samples.thermal) or limited
                 if written is not None and time.monotonic() - written_at >= JOB_WRITTEN_EVERY_S:
                     written_at = time.monotonic()
-                    report_job_written(written[1], state_dir, written[0], watch_pid, disk_path,
+                    report_job_written(written[1], state_dir, written[0], watch_pid, written[2], disk_path,
                                        samples.disk_free_start)
             except Exception:  # noqa: BLE001  (a bad sample is skipped, not fatal)
                 pass
@@ -11662,7 +11814,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 break
         if written is not None:
             with contextlib.suppress(OSError):
-                job_written_file(state_dir, written[0]).unlink()
+                clear_job_written(state_dir, written[0], written[2], job_ended=True)
         if disk_path:
             samples.disk_free_end = free_or_none(disk_path)
         record = samples.summary(time.time())
@@ -11687,7 +11839,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         os._exit(0)
 
 
-def report_job_written(tracker: JobWritten, state_dir: Path, runner_name: str, worker_pid: int,
+def report_job_written(tracker: JobWritten, state_dir: Path, runner_name: str, worker_pid: int, nonce: str,
                        disk_path: str | None, free_start: float | None) -> float | None:
     """RUNNER_JOB_WRITTEN: measure what the job has written (capped by its free-disk drop since admission) and write
     it for the other runners' gates; unmeasured, the file is removed, so they charge the full p95."""
@@ -11695,11 +11847,9 @@ def report_job_written(tracker: JobWritten, state_dir: Path, runner_name: str, w
     drop = None if free is None or free_start is None else free_start - free
     value = tracker.written(drop)
     if value is None:
-        with contextlib.suppress(OSError):
-            job_written_file(state_dir, runner_name).unlink()
+        clear_job_written(state_dir, runner_name, nonce)
         return None
-    write_job_written(state_dir, runner_name, worker_pid, value, time.time())
-    return value
+    return value if write_job_written(state_dir, runner_name, worker_pid, nonce, value, time.time()) else None
 
 
 def finish_sampler(state_dir: Path, wait_s: float = 5.0) -> str:

@@ -10797,6 +10797,20 @@ class GateTest(unittest.TestCase):
                                     "window": {"from": "2026-11-02", "to": "2026-11-15"}}))
         return path
 
+    def fake_identities(self) -> dict[int, str]:
+        """RUNNER_JOB_WRITTEN: fake Runner.Worker pids get a start identity each (process_identity), changed by
+        setting the returned map."""
+        identities: dict[int, str] = {}
+        patcher = mock.patch.object(hook, "process_identity", side_effect=lambda pid: identities.get(pid, f"t:{pid}"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return identities
+
+    def job_written(self, runner: str, pid: int, gib: float, at: float) -> None:
+        """RUNNER_JOB_WRITTEN: a job of runner (Runner.Worker pid) began and its sampler wrote gib at at."""
+        self.assertTrue(hook.write_job_written(self.state, runner, pid, hook.begin_job_written(self.state, runner, pid),
+                                               gib, at))
+
     def workers(self, *runners: str) -> dict[int, tuple[int, str]]:
         """A process table with a Runner.Worker of each named runner install beside self.runner, plus noise that is no
         job of this host's runners: a listener, and a Worker of a runner install outside this home."""
@@ -10880,6 +10894,7 @@ class GateTest(unittest.TestCase):
         2026-11-17 12:36Z-12:55Z cmux17/18/19/21 held side-std listeners at 25-35 GiB free while 160 jobs queued: a
         running job's full p95 was reserved although it had already written it. A job that wrote 5 GiB of its 5.3 is
         charged 0.3; an unmeasured one (no file, another Worker's, stale) still the full 5.3; the next job always 5.3."""
+        self.fake_identities()
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
         for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3"):
             (self.tmp / name).mkdir()
@@ -10894,35 +10909,36 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(gate, "evict_in_background"), \
                 mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
             self.assertIn("21.0 GiB free, 25.9 GiB required", gate.low_disk() or "", "unmeasured: full p95 each")
-            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 5.0, now)
+            self.job_written("actions-runner-glaeda-2", 100, 5.0, now)
             self.assertAlmostEqual(hook.job_written_gib(self.state, "actions-runner-glaeda-2", 100), 5.0)
             self.assertIsNone(gate.low_disk(), "10 + 0.3 + 5.3 + 5.3 = 20.9 GiB: the written 5 GiB is not reserved again")
             free["gib"] = 20.5
             why = gate.low_disk()
             self.assertIn("20.5 GiB free, 20.9 GiB required", why or "")
             self.assertIn("less 5 GiB the running jobs already wrote (RUNNER_JOB_WRITTEN)", why or "")
-            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 9.0, now)
+            self.job_written("actions-runner-glaeda-2", 100, 9.0, now)
             free["gib"] = 20.7
             self.assertIsNone(gate.low_disk(), "past its p95 a job is charged 0: 10 + 0 + 5.3 + 5.3 = 20.6")
             free["gib"] = 20.5
             self.assertIn("20.5 GiB free, 20.6 GiB required", gate.low_disk() or "", "charged 0, never less")
             free["gib"] = 21.0
-            hook.write_job_written(self.state, "actions-runner-glaeda-2", 77, 5.0, now)
+            self.job_written("actions-runner-glaeda-2", 77, 5.0, now)
             self.assertIn("25.9 GiB required", gate.low_disk() or "", "another Worker's file: the full p95")
-            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 5.0,
+            self.job_written("actions-runner-glaeda-2", 100, 5.0,
                                    now - hook.JOB_WRITTEN_FRESH_S - 60)
             self.assertIn("25.9 GiB required", gate.low_disk() or "", "a stale file: the full p95")
             hook.job_written_file(self.state, "actions-runner-glaeda-2").write_text("{nope")
             self.assertIn("25.9 GiB required", gate.low_disk() or "", "a malformed file: the full p95")
             # the new job and a listener before it are never discounted, whatever files exist
-            hook.write_job_written(self.state, self.runner.name, 100, 5.0, now)
-            hook.write_job_written(self.state, "actions-runner-glaeda-3", 4242, 5.0, now)
+            self.job_written(self.runner.name, 100, 5.0, now)
+            self.job_written("actions-runner-glaeda-3", 4242, 5.0, now)
             self.assertIn("25.9 GiB required", gate.low_disk() or "")
 
     def test_a_job_measures_what_it_wrote_in_its_work_and_linked_scratch(self) -> None:
         """The sampler's side of RUNNER_JOB_WRITTEN: _work's and the linked spm-scratch root's growth since first seen,
         capped by the job's free-disk drop (an APFS clone du counts whole never reads as written); no _work reading:
         unmeasured, and the file goes so the gates charge the full p95."""
+        self.fake_identities()
         runner = self.tmp / "actions-runner-glaeda-2"
         workspace = runner / "_work/cmux/cmux"
         package = workspace / "Packages/CmuxNext/Core"
@@ -10941,14 +10957,102 @@ class GateTest(unittest.TestCase):
         self.assertEqual(tracker.written(50.0), 5.0)
         self.assertEqual(tracker.written(1.5), 1.5, "capped by the free-disk drop: clones cost nothing")
         self.assertIsNone(tracker.written(None), "no free-disk reading: unmeasured")
+        nonce = hook.begin_job_written(self.state, runner.name, 321)
         with mock.patch.object(hook, "free_or_none", return_value=40.0):
-            self.assertEqual(hook.report_job_written(tracker, self.state, runner.name, 321, "/", 45.0), 5.0)
+            self.assertEqual(hook.report_job_written(tracker, self.state, runner.name, 321, nonce, "/", 45.0), 5.0)
         self.assertEqual(hook.job_written_gib(self.state, runner.name, 321), 5.0, "the gates read what it wrote")
         sizes.pop(runner / "_work")
         with mock.patch.object(hook, "free_or_none", return_value=40.0):
-            self.assertIsNone(hook.report_job_written(tracker, self.state, runner.name, 321, "/", 45.0))
+            self.assertIsNone(hook.report_job_written(tracker, self.state, runner.name, 321, nonce, "/", 45.0))
         self.assertFalse(hook.job_written_file(self.state, runner.name).exists(), "unmeasured: the file goes")
         self.assertIsNone(hook.JobWritten(runner / "_work", workspace, du).written(50.0), "no baseline: unmeasured")
+
+    def test_an_earlier_jobs_written_record_is_never_the_next_jobs(self) -> None:
+        """RUNNER_JOB_WRITTEN is keyed by a per-job nonce, not by the Runner.Worker pid and freshness alone: an earlier
+        job's record (its sampler late, or its cleanup missed) whose pid the next job's Worker reuses is never charged
+        to that job, and the earlier job's late write or cleanup never overwrites or deletes the next job's record."""
+        self.fake_identities()
+        runner = "actions-runner-glaeda-2"
+        now = time.time()
+        first = hook.begin_job_written(self.state, runner, 100)
+        self.assertTrue(first)
+        self.assertTrue(hook.write_job_written(self.state, runner, 100, first, 5.0, now))
+        self.assertEqual(hook.job_written_gib(self.state, runner, 100, now), 5.0)
+        # the next job on the same runner, its Runner.Worker given the same pid, while the first record is still fresh
+        second = hook.begin_job_written(self.state, runner, 100)
+        self.assertTrue(second)
+        self.assertNotEqual(first, second)
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now),
+                          "the earlier job's record is not the next job's: it is charged the full p95")
+        self.assertFalse(hook.write_job_written(self.state, runner, 100, first, 9.0, now),
+                         "the earlier job's late sampler writes nothing once the next job began")
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now))
+        self.assertTrue(hook.write_job_written(self.state, runner, 100, second, 2.0, now))
+        self.assertEqual(hook.job_written_gib(self.state, runner, 100, now), 2.0)
+        hook.clear_job_written(self.state, runner, first)
+        hook.clear_job_written(self.state, runner, first, job_ended=True)
+        self.assertEqual(hook.job_written_gib(self.state, runner, 100, now), 2.0,
+                         "the earlier job's cleanup leaves the next job's record")
+        self.assertTrue(hook.job_written_file(self.state, runner).exists())
+        hook.clear_job_written(self.state, runner, second, job_ended=True)
+        self.assertFalse(hook.job_written_file(self.state, runner).exists(), "its own job's cleanup removes it")
+        self.assertFalse(hook.job_nonce_file(self.state, runner).exists(), "and, the job over, its nonce")
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now))
+
+    def test_a_pid_reused_before_the_next_job_started_is_not_the_job(self) -> None:
+        """RUNNER_JOB_WRITTEN: a job whose sampler never cleaned up (killed, a reboot) leaves its nonce and record; a
+        new process given the same pid before any job-started draws a nonce is not that Worker (its start identity
+        differs), so it gets no discount."""
+        identities = self.fake_identities()
+        runner, now = "actions-runner-glaeda-2", time.time()
+        nonce = hook.begin_job_written(self.state, runner, 100)
+        self.assertTrue(hook.write_job_written(self.state, runner, 100, nonce, 5.0, now))
+        self.assertEqual(hook.job_written_gib(self.state, runner, 100, now), 5.0)
+        identities[100] = "t:reused"
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now))
+        identities[100] = None
+        self.assertIsNone(hook.job_written_gib(self.state, runner, 100, now), "an unreadable identity: unmeasured")
+        self.assertIsNone(hook.begin_job_written(self.state, runner, 100), "no identity to name: unmeasured")
+
+    def test_a_forged_job_written_record_is_never_honoured(self) -> None:
+        """RUNNER_JOB_WRITTEN: a record discounts disk the gate then admits work against, so only the hook's own record
+        counts: one in the hook's private job-written directory (its uid's, no group or other access), a regular
+        file of the gate's uid with no group or other access, never a symlink, carrying the job's nonce. A record a
+        job forged with the matching pid and nonce in the state directory it can write is not honoured."""
+        self.fake_identities()
+        runner, pid = "actions-runner-glaeda-2", 100
+        now = time.time()
+        nonce = hook.begin_job_written(self.state, runner, pid)
+        self.assertTrue(nonce)
+        forged = {"schema": hook.JOB_WRITTEN_SCHEMA, "worker_pid": pid, "nonce": nonce, "written_gib": 5.0,
+                  "at": round(now, 1)}
+        (self.state / f"job-written-{runner}.json").write_text(json.dumps(forged))
+        self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now),
+                          "a record in the job-writable state directory is not the hook's")
+        path = hook.job_written_file(self.state, runner)
+        self.assertNotEqual(path.parent, self.state)
+        self.assertTrue(hook.write_job_written(self.state, runner, pid, nonce, 5.0, now))
+        self.assertEqual(hook.job_written_gib(self.state, runner, pid, now), 5.0, "the hook's own record counts")
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode) & 0o077, 0)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0)
+        path.chmod(0o644)
+        self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now), "group or other access: not honoured")
+        path.chmod(0o600)
+        path.parent.chmod(0o755)
+        self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now), "a loose directory: not honoured")
+        path.parent.chmod(0o700)
+        with mock.patch.object(hook.os, "getuid", return_value=os.getuid() + 1):
+            self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now), "another uid's: not honoured")
+            hook.clear_job_written(self.state, runner, nonce, job_ended=True)
+        self.assertTrue(path.exists(), "cleanup never removes a record that is not its uid's")
+        real = path.with_name("elsewhere.json")
+        os.replace(path, real)
+        path.symlink_to(real)
+        self.assertIsNone(hook.job_written_gib(self.state, runner, pid, now), "a symlink: not honoured")
+        path.unlink()
+        self.assertTrue(hook.write_job_written(self.state, runner, pid, nonce, 3.0, now))
+        hook.clear_job_written(self.state, runner, nonce, job_ended=True)
+        self.assertFalse(path.exists(), "its own job's cleanup removes its own record")
 
     def test_an_installed_hook_reads_the_staged_runner_job_disk(self) -> None:
         """The hook runs from ~/actions-runner-glaeda-K/glaeda-hooks/; the json is the staged runner copy in
@@ -13178,6 +13282,27 @@ class GateTest(unittest.TestCase):
                 hook.note_listener_restart(self.state, self.runner, {"t": n})
         lines = (self.state / hook.GATE_RESTARTS_FILE).read_text().splitlines()
         self.assertEqual([json.loads(x)["t"] for x in lines], [2, 3, 4])
+
+    def test_concurrent_gates_lose_no_listener_restart(self) -> None:
+        """Every runner's gate notes its restarts in the one listener-restarts.jsonl: a read, modify and replace
+        that two gates run at once kept only one of their lines. Each note is one locked step."""
+        children = []
+        for g in range(6):
+            pid = os.fork()
+            if pid == 0:
+                code = 0
+                try:
+                    for n in range(25):
+                        hook.note_listener_restart(self.state, self.runner, {"g": g, "t": n})
+                except BaseException:  # noqa: BLE001
+                    code = 1
+                os._exit(code)
+            children.append(pid)
+        for pid in children:
+            self.assertEqual(os.waitpid(pid, 0)[1], 0)
+        lines = (self.state / hook.GATE_RESTARTS_FILE).read_text().splitlines()
+        self.assertEqual(sorted((json.loads(x)["g"], json.loads(x)["t"]) for x in lines),
+                         [(g, n) for g in range(6) for n in range(25)], "150 notes, 150 lines")
 
     def test_listen_stops_and_restarts_a_real_listener(self) -> None:
         proc, log = self.run_listen()
@@ -18062,6 +18187,28 @@ class JobTelemetryTest(unittest.TestCase):
             time.sleep(0.1)
         [record] = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual((record["roots"], record["gui"], "roots_admitted" in record), (["root-1"], False, False))
+
+    def test_a_sampled_job_names_its_nonce_and_takes_it_away_when_it_ends(self) -> None:
+        """RUNNER_JOB_WRITTEN: job-started draws the job's nonce for its runner and Runner.Worker before it returns;
+        the sampler removes it once the Worker is gone, so no record is trusted between jobs."""
+        watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (watched.kill(), watched.wait()))
+        state = self.dir / "state"
+        log = self.dir / "jobs.jsonl"
+        state.mkdir()
+        workspace = self.dir / "actions-runner-glaeda-2/_work/cmux/cmux"
+        workspace.mkdir(parents=True)
+        self.hook.start_sampler(watched.pid, state, {"job": "x"}, log, interval=0.2, disk_path=os.fspath(self.dir),
+                                workspace=os.fspath(workspace))
+        nonce = self.hook.current_job_nonce(state, "actions-runner-glaeda-2", watched.pid)
+        self.assertTrue(nonce, "drawn before job-started returns")
+        watched.kill()
+        watched.wait()
+        deadline = time.monotonic() + 10
+        while (not log.exists() or not log.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(log.exists() and log.read_text(), "the sampler ended")
+        self.assertFalse(self.hook.job_nonce_file(state, "actions-runner-glaeda-2").exists())
 
     def test_roots_released_after_the_pid_file_goes_are_not_read_as_empty(self) -> None:
         # finish_sampler removes the pid file, then job-completed removes .roots while the worker still lives

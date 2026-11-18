@@ -55,7 +55,8 @@ re-runs it elsewhere) when:
 Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
 it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
 With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2d) it takes a weighted
-share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity (take_capacity). When
+share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity (take_capacity; a gateway
+client takes its token and no host.lock, GATEWAY_NO_HOST_LOCK). When
 they are taken a cmux job waits for them, with no time limit, and logs what it waits for and who holds it
 (CAPACITY_WAIT); another repository's job waits --guest-wait seconds and then refuses with "refused: capacity: ...".
 Only then does it trigger the same queued glaeda-disk --pressure pass job-completed does (below), never able to fail
@@ -676,6 +677,15 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cmux-next-tab-switch.yml's frames (an advisory pull request check; Leo, 2026-11-15, asked for CI on tab switching)
 # submits scripts/measure/tab-switch.sh (cmux-ci run --class exclusive --measurement --display) for a pull request
 # head that touches a tab, a pane or the chat pane, and waits at most 130 min (1 h queue, 1 h step), once per head.
+# GATEWAY_NO_HOST_LOCK: a gateway job takes no shared host.lock (take_capacity), so a fleet worker may claim the mini
+# while the client waits. Leo, 2026-11-17: "also fix the measurement queue so this never stalls again". At 23:52Z
+# cmux22, cmux23 and cmux17 were claim-paused runner_job at 1-8% CPU: their gateway jobs (hot-verify look) held
+# host.lock shared while their one process, ci-client.py, waited at 0% CPU for fleet steps that needed exactly these
+# gui-session-v1 minis, so the lend drain waited for jobs that waited for it (cmuxterm-hq#13078). The fleet worker
+# likewise counts no such waiter as a running job (cmuxterm-hq build-fleet/cmd/worker/gateway_waiter.go). The gateway
+# token still bounds the clients, a signing job still takes both tokens, and the gate still stops the listener while
+# a fleet build holds host.lock exclusively, so no new client starts beside a claimed build; one already waiting
+# keeps waiting at no cost.
 GATEWAY_CLASS = "gateway"
 GATEWAY_TOKEN_KIND = "gateway"  # CLASS_COST's token kind: any one of GATEWAY_TOKENS
 GATEWAY_TOKENS = ("gateway-0", "gateway-1")
@@ -6618,7 +6628,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     reserved unit. A costlier one waits its turn (fair_turn) like any job; its gate keeps the reserve until it is
     admitted (Gate.admitted), so the reserved unit stays out of other lanes' reach meanwhile.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
-    takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
+    takes it exclusively, so the build worker and our jobs exclude each other; a gateway client takes none,
+    GATEWAY_NO_HOST_LOCK), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
     if klass:  # a class given outright (a ci-step, the fast tier, a console skipper admitted as light) costs its own
         pinned, need = False, class_need(klass)
@@ -6704,7 +6715,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if uses_gui or klass == EXCLUSIVE_CLASS:  # it drives the console session, or takes the whole mini: the idle
             yielded += yield_idle_fuzz(capacity_dir)  # fuzzer's app must be gone first
-        if os.path.isdir(os.path.dirname(host_lock)):
+        # GATEWAY_NO_HOST_LOCK: a gateway client (GATEWAY_JOBS) takes no host.lock. It only waits on the fleet, and
+        # its step often needs this very mini (cmuxterm-hq#13078).
+        if klass != GATEWAY_CLASS and os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
             for attempt in range(6):  # a fleet probe takes it exclusively for microseconds; a build keeps it
@@ -9003,12 +9016,107 @@ def host_taken(host_lock: str) -> bool:
 
 def runner_job_running() -> bool:
     """Whether a runner job runs on this mini (a Runner.Worker process), as the build worker's claimHost asks. A
-    pgrep that fails or hangs counts as busy, so a drain's hold never ages on a reading that could not tell."""
+    pgrep that fails or hangs counts as busy, so a drain's hold never ages on a reading that could not tell. A gateway
+    waiter (working_runner_jobs) is no running job, as the worker reads it too; a ps that cannot tell counts as busy."""
     try:
         done = subprocess.run(["/usr/bin/pgrep", "-q", "-x", "Runner.Worker"], timeout=5, check=False)
     except (OSError, subprocess.SubprocessError):
         return True
-    return done.returncode != 1
+    if done.returncode == 1:
+        return False
+    # GATEWAY_NO_HOST_LOCK: a gateway waiter is no running job, as the worker reads it (gateway_waiter.go)
+    try:
+        table = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,pcpu=,args="], timeout=5, check=False,
+                               capture_output=True, text=True, env={"LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if table.returncode != 0 or not isinstance(table.stdout, str):
+        return True
+    rows = parse_process_table(table.stdout)
+    return rows is None or working_runner_jobs(rows, gateway_runner_dir) > 0
+
+
+# GATEWAY_WAITER_MAX_CPU: the most %CPU (100 = one core) a gateway job's whole process tree may use and still be a
+# waiter; cmuxterm-hq's worker uses the same mark (gateway_waiter.go gatewayWaiterMaxCPU). A waiting ci-client and its
+# Runner.Worker read 0.0-0.6 (2026-11-18).
+GATEWAY_WAITER_MAX_CPU = 10.0
+WAITER_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "tee", "sleep", "cat"})
+
+
+def parse_process_table(text: str) -> list[tuple[int, int, float, str]] | None:
+    """(pid, ppid, pcpu, args) rows of `ps -A -o pid=,ppid=,pcpu=,args=`; None when any row does not parse (a row
+    it skipped may be a working job's)."""
+    rows = []
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 4:
+            return None
+        try:
+            rows.append((int(fields[0]), int(fields[1]), float(fields[2]), " ".join(fields[3:])))
+        except ValueError:
+            return None
+    return rows
+
+
+def fleet_client_process(args: str) -> bool:
+    """The fleet client: cmux-fleet-client's ci-client.py run by an interpreter, or its launcher."""
+    words = args.split()[:2]
+    for i, word in enumerate(words):
+        if i == 1 and not (os.path.basename(words[0]).startswith("python") or os.path.basename(words[0]) == "Python"
+                           or os.path.basename(words[0]) in {"bash", "sh", "zsh", "dash"}):
+            break
+        if "/cmux-fleet-client/" in word or os.path.basename(word) in {"cmux-ci", "cmux-fleet-client", "ci-client.py"}:
+            return True
+    return False
+
+
+def gateway_runner_dir(runner_dir: str) -> bool:
+    """Whether runner_dir's job-started hook passes --gateway-runner (runner_scope's flag)."""
+    try:
+        fd = os.open(os.path.join(runner_dir, RUNNER_HOOK_SCRIPT), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        text = os.read(fd, 64 << 10).decode("utf-8", "replace")
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return re.search(r"\s--gateway-runner(?:\s|$)", text) is not None
+
+
+def working_runner_jobs(rows: list[tuple[int, int, float, str]], is_gateway: Callable[[str], bool]) -> int:
+    """Runner.Worker processes that work: every one but a gateway runner's job whose tree is only shells, tee and
+    a waiting fleet client under GATEWAY_WAITER_MAX_CPU."""
+    children: dict[int, list[tuple[int, int, float, str]]] = {}
+    for row in rows:
+        children.setdefault(row[1], []).append(row)
+    working = 0
+    for pid, _, cpu, args in rows:
+        exe = args.split()[0]
+        if os.path.basename(exe) != "Runner.Worker":
+            continue
+        waiter = os.path.isabs(exe) and is_gateway(os.path.dirname(os.path.dirname(exe)))
+        client, seen, queue = False, {pid}, [pid]
+        while waiter and queue:
+            for child in children.get(queue.pop(), []):
+                if child[0] in seen:
+                    continue
+                seen.add(child[0])
+                if fleet_client_process(child[3]):
+                    client = True
+                elif os.path.basename(child[3].split()[0]) not in WAITER_SHELLS:
+                    waiter = False
+                    break
+                cpu += child[2]
+                queue.append(child[0])
+        if not (waiter and client and cpu < GATEWAY_WAITER_MAX_CPU):
+            working += 1
+    return working
 
 
 def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float | None = None,

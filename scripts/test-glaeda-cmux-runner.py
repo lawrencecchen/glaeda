@@ -4007,6 +4007,42 @@ class HookTest(unittest.TestCase):
         self.assertTrue(set(hook.GATEWAY_TOKENS) <= set(hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]))
         self.assertEqual(hook.CLASS_COST[hook.GATEWAY_CLASS], (0, (hook.GATEWAY_TOKEN_KIND,)))
 
+    def test_a_gateway_job_takes_no_host_lock(self) -> None:
+        """GATEWAY_NO_HOST_LOCK (cmuxterm-hq#13078; Leo, 2026-11-17: "also fix the measurement queue so this never
+        stalls again"). A gateway client only waits on the fleet, often for a step that needs this very mini, so
+        holding host.lock shared kept the fleet worker's lend drain waiting for a job that waited for it. Every
+        GATEWAY_JOBS job is admitted without host.lock: a fleet build can claim the mini while it waits, and one
+        handed to the runner while a build holds the mini still starts. Detector for cmuxterm-hq's handbook page
+        fleet-waiter-job-holds-its-mini.md."""
+        import fcntl
+        fleet = self.fleet()
+        for workflow, job in sorted(hook.GATEWAY_JOBS):
+            env = {"GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/{workflow}@refs/heads/x"}
+            with self.subTest(workflow=workflow, job=job):
+                try:
+                    ok = self.job(job, "gw", 14, None, "--gateway-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertIn(f"for {job} (gateway", ok.stdout)
+                    self.assertTrue(self.lock_free(), f"{workflow} {job} holds host.lock while it waits on the fleet")
+                finally:
+                    self.finish("gw")
+                build = os.open(fleet / "host.lock", os.O_RDWR)  # a fleet build has the mini
+                try:
+                    fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    ok = self.job(job, "gw", 14, None, "--gateway-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertNotIn("holds the host lock", ok.stdout)
+                finally:
+                    os.close(build)
+                    self.finish("gw")
+        # the control: any other job still holds host.lock shared for its whole run
+        try:
+            side = self.job("app-compile-fleet", "s0", 20, None, env=self.FAST_TIER)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertTrue(self.shared_lock_blocks_exclusive(), "a side job no longer holds host.lock")
+        finally:
+            self.finish("s0")
+
     def test_job_log_records_started_refused_and_completed(self) -> None:
         self.fleet()
         log = self.dir / "Library/Logs/glaeda-cmux-jobs.jsonl"
@@ -9745,6 +9781,33 @@ class GateTest(unittest.TestCase):
             self.assertTrue(hook.runner_job_running())
         with mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired("pgrep", 5)):
             self.assertTrue(hook.runner_job_running(), "a reading that cannot tell counts as busy")
+
+    def test_a_gateway_waiter_is_no_running_job_for_a_drain(self) -> None:
+        """GATEWAY_NO_HOST_LOCK: a drain's busy reading (host_taken) agrees with the worker's claimHost
+        (cmuxterm-hq gateway_waiter.go): a gateway runner's job whose tree is only a waiting fleet client does not
+        count; any other work in it, CPU over the mark, or a runner that is not a gateway runner does."""
+        base = ("53339 87196 0.6 /U/actions-runner-glaeda-4/bin/Runner.Worker spawnclient 156 159\n"
+                "54480 53339 0.0 /opt/homebrew/bin/bash -e /U/actions-runner-glaeda-4/_work/_temp/x.sh\n"
+                "54482 54480 0.0 /opt/homebrew/bin/python3 /U/.local/share/cmux-fleet-client/versions/v/ci-client.py run\n"
+                "54483 54480 0.0 tee -a /U/actions-runner-glaeda-4/_work/_temp/look.log\n")
+        gateway = lambda d: d == "/U/actions-runner-glaeda-4"  # noqa: E731
+        self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base), gateway), 0)
+        for extra in ("60000 54480 0.0 /usr/bin/git fetch\n", "60001 54482 40.0 /bin/sh -c true\n"):
+            self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base + extra), gateway), 1, extra)
+        self.assertEqual(hook.working_runner_jobs(hook.parse_process_table(base), lambda d: False), 1)
+        self.assertIsNone(hook.parse_process_table(base + "1 1 0,6 x\n"))
+        runner = self.tmp / "actions-runner-glaeda-4"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        self.assertFalse(hook.gateway_runner_dir(os.fspath(runner)))
+        (runner / hook.RUNNER_HOOK_SCRIPT).write_text("exec hook job-started --gateway-runner --instance 4\n")
+        self.assertTrue(hook.gateway_runner_dir(os.fspath(runner)))
+        table = base.replace("/U/actions-runner-glaeda-4", os.fspath(runner))
+        answers = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0, stdout=table)]
+        with mock.patch.object(hook.subprocess, "run", side_effect=answers):
+            self.assertFalse(hook.runner_job_running(), "a mini with only a gateway waiter reads as busy")
+        answers = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0, stdout=table + "60000 54480 0.0 /usr/bin/git fetch\n")]
+        with mock.patch.object(hook.subprocess, "run", side_effect=answers):
+            self.assertTrue(hook.runner_job_running())
 
     def test_a_capture_lease_drain_is_a_drain_waiter_and_says_so(self) -> None:
         # cmuxterm-hq's worker publishes an exclusive (capture) lease's waiter as "capture_lease_drain", not

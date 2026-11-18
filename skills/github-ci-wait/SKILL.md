@@ -239,7 +239,9 @@ glaeda-gh land cancel OWNER/REPO#N
   merges nothing. The calls carry `CMUX_AGENT_SESSION=glaeda-land` and `MAY_MERGE_PATH=glaeda-land`.
 - It stops and tells the requester (`acpmux send --no-wait`, default this host/`$ACPMUX_SESSION_NAME`)
   only on a real stop: a BLOCK, a hold, a conflict, a step only a person can take, the PR or an
-  `--after` PR closed, or 3 identical refusals in a row. On a stop, do the named step, then `land` again.
+  `--after` PR closed, or 3 identical refusals in a row. A refusal naming an update-branch never counts
+  toward that: the daemon sends it pinned, once per head, and judges the new head. On a stop, do the
+  named step, then `land` again.
 - A PR that reads MERGED ends its entry merged; CLOSED ends it "closed unmerged", naming no step. A
   step GitHub refused because the PR is closed, or a base change on a lane VM's stale copy, reads the
   PR's state first; an unreadable state waits, never counting toward a stop.

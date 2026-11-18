@@ -18005,7 +18005,7 @@ class LandTest(Base):
             e = self.tick(30)
         self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
         self.assertEqual((len(self.w.gh_calls("pr", "update-branch")), len(self.w.explains())), (1, 1))
-        self.assertEqual(e["streak"]["count"], 1)  # the one judgment before the step, never more
+        self.assertIsNone(e.get("streak"))  # a refusal naming update-branch never counts toward the 3-refusal stop
         self.assertEqual([m[-1] for m in self.w.sent()], ["glaeda land: https://github.com/o/r/pull/1 merged at "
                                                           + "f" * 40])
 
@@ -18077,8 +18077,9 @@ class LandTest(Base):
         for _ in range(3):
             e = self.tick(30)
         self.assertEqual(e["stateOpen"], LA)
-        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 2)
-        self.assertEqual(e["stepFail"]["count"], 1)
+        # no 3-refusal stop on an update: the third judgment sends it again, and the step's own count runs
+        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 3)
+        self.assertEqual((e["state"], e["stepFail"]["count"]), ("waiting", 2))  # counted from the OPEN read on
 
     def test_a_host_with_its_own_login_keeps_the_pinned_rest_update_branch(self):
         # gh's own `pr update-branch` takes no head: off a lane VM the pinned REST PUT stays.
@@ -18848,11 +18849,140 @@ class LandTest(Base):
         self.w.gh_rc["update"] = 1
         self.w.gh_err["update"] = "gh: gh api -X PUT: only a media upload goes through the broker."
         e = self.run_hour(lambda: refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
-        # The judge's own streak (stale_green, this head, update_branch) is no longer reset by the step's refusal, so
-        # the third identical judgment stops it: two update-branch steps, 60 s apart, not 30.
-        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.gh_calls("api"))), ("stopped", "stale_green", 2))
+        # A refusal naming update-branch never counts toward the 3-refusal stop (the update is the step): the step's
+        # own backoff (60, 120, ... s) runs, and its LAND_STEP_STOP-th refusal at the head stops it, not 30 in 40 min.
+        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.gh_calls("api"))),
+                         ("stopped", "update_branch_refused", gg.LAND_STEP_STOP))
         steps = [h["at"] for h in e["history"] if h["event"] == "step"]
-        self.assertEqual(round(steps[1] - steps[0]), 60)
+        self.assertEqual([round(b - a) for a, b in zip(steps, steps[1:])], [60, 120, 240, 480, 960])
+
+    UPDATE_CODES = {  # every merge_hold code whose step is the pinned update-branch (merge_hold _step), and its args
+        "tip_merge": {}, "stale_green": {}, "ws_check_stale_base": {"needs_newer_base": ["ws-check"]},
+        "startup_failure": {"needs_newer_base": ["ci"]}, "red_not_excused": {"needs_newer_base": ["build"]},
+    }
+
+    def test_an_update_branch_refusal_never_counts_toward_the_three_refusal_stop(self):
+        # cmux#45870 (stale_green) on gcp-codex-lane-11, 2026-11-18: judged, update-branch refused, judged, refused,
+        # judged: "3 identical refusals in a row", the named update never taken; a coordinator ran it by hand on
+        # cmux#44938, #45870, #45709 and #46281. Here the update is refused twice, then sent: the entry never stops.
+        for code, args in self.UPDATE_CODES.items():
+            with self.subTest(code=code):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA)
+                self.land()
+                self.w.gh_rc["update"] = 1
+                self.w.gh_err["update"] = "gh: update_branch: broker refused: the base merge gate is not open yet."
+                answer = lambda: refusal(code, LA, {"kind": "update_branch", "expected_head_sha": LA, **args})
+                e = self.run_hour(answer, seconds=200)  # judged and refused at 0 s and at 60 s, then judged at 180 s
+                updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+                self.assertEqual(len(updates), 3)
+                self.assertNotEqual(e["state"], "stopped", e.get("stop"))
+                self.w.gh_rc["update"] = 0
+                e = self.run_hour(answer, seconds=400)
+                updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+                self.assertEqual((e["state"], len(updates)), ("waiting", 4), e.get("stop"))
+                self.assertTrue(all(c[-1] == f"expected_head_sha={LA}" for c in updates), "pinned to the judged head")
+                self.assertNotIn("identical refusals", " ".join(" ".join(m) for m in self.w.sent()))
+                # requeued for the new head: judged there, and merged pinned to it
+                self.pr(LB)
+                self.w.answers[:] = [ok_answer(LB)]
+                self.tick()
+                self.assert_merged_at(LB)
+
+    def test_the_named_update_runs_once_per_head(self):
+        # Sent once at a head, a second refusal naming update-branch at that same head never sends it again: it
+        # waits for the new head, and stops (saying so, not "identical refusals") if none shows within the wait.
+        self.pr(LA)
+        self.land()
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=2 * gg.LAND_WAIT_DEFAULT, step=30.0)
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_no_new_head"))
+        self.assertLessEqual(len(self.w.explains()), 4)  # one wait for the new head, not a judgment every 300 s
+        self.assertIn("update_once", [h["event"] for h in e["history"]])
+        self.assertNotIn("identical refusals", self.w.sent()[-1][-1])
+
+    def test_an_update_at_a_new_head_is_sent_again(self):
+        # once per head: the update's own head, judged stale again (the base moved during its CI), takes its own
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB)
+        self.w.answers.append(refusal("stale_green", LB, {"kind": "update_branch", "expected_head_sha": LB}))
+        e = self.tick()
+        updates = [c[-1] for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(updates, [f"expected_head_sha={LA}", f"expected_head_sha={LB}"])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
+    def test_an_update_interrupted_by_a_restart_is_not_sent_again_at_that_head(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.w.raise_on = "update-branch"
+        with self.assertRaises(LandCrash):
+            self.tick()
+        self.w.raise_on = None
+        self.q = self.queue()
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=600, step=30.0)
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual((len(updates), e["state"]), (1, "waiting"))  # the crashed one only
+
+    def test_an_update_cancelled_before_it_was_sent_is_sent_after_the_reexec(self):
+        # review F1: a claim refused while the daemon drains for a re-exec sent nothing, so it never counts as sent
+        self.pr(LA)
+        self.land()
+        answer = lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA})
+        self.w.answers.append(answer())
+        self.q.draining = True
+        self.tick()
+        self.assertEqual(self.w.gh_calls("api"), [])
+        self.q = self.queue()
+        e = self.run_hour(answer, seconds=60)
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual((len(updates), e["state"], e["wait"]["kind"]), (1, "waiting", "head_change"))
+
+    def test_update_refusals_in_varying_words_still_stop_on_the_steps_count(self):
+        # review F4: the judgment's streak no longer bounds them, so the step's count is per head, whatever the words
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        words = iter(f"gh: update_branch: broker said no ({i})" for i in range(100))
+
+        def answer():
+            self.w.gh_err["update"] = next(words)
+            return refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA})
+        e = self.run_hour(answer)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_refused"))
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), gg.LAND_STEP_STOP)
+
+    def test_a_timed_out_update_counts_as_sent_and_landing_again_starts_over(self):
+        # review F3: a timeout may have reached GitHub; review F2: a fresh land after a stop may send it again
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 124
+        answer = lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA})
+        e = self.run_hour(answer, seconds=gg.LAND_UPDATE_ONCE + 900, step=60.0)
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual((len(updates), e["state"], e["stop"]["code"]), (1, "stopped", "update_branch_no_new_head"))
+        self.w.gh_rc["update"] = 0
+        self.land()
+        e = self.run_hour(answer, seconds=60)
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual((len(updates), e["state"]), (2, "waiting"))
+
+    def test_a_teammate_refusal_never_sends_an_update(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("teammate", LA, {"kind": "stop", "stop": "teammate", "why": "a teammate's PR"},
+                                      nxt=f"gh api -X PUT repos/o/r/pulls/1/update-branch -f expected_head_sha={LA}"))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.gh_calls("api")), ("stopped", "teammate", []))
 
     def test_no_update_branch_while_the_heads_checks_run(self):
         self.pr(LA)

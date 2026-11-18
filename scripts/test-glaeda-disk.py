@@ -5314,6 +5314,90 @@ class GlaedaDiskTest(unittest.TestCase):
         self._main_run(["report"])
         self.assertEqual(len((self.root / "runs.jsonl").read_text().splitlines()), 3)
 
+    def test_the_cache_budget_runs_on_fresh_sizes_and_only_in_a_pressure_run(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        if self.root.stat().st_dev != dev:
+            self.skipTest("the fake volume is HOME's; this temp dir is on another")
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        dd = gd.Family("xcode-derived-data", self.root / "dd", True, "", min_idle_hours=12)
+        dd.root.mkdir()
+        warm, gone = dd.root / "warm", dd.root / "gone"
+        warm.mkdir()
+        stale = {os.fspath(warm): 100 * gd.GIB, os.fspath(gone): 300 * gd.GIB}  # gone was deleted since
+
+        def survey(fams, idle, min_bytes, known, **kw):  # what the survey measured just now
+            known.clear()
+            known[os.fspath(warm)] = 10 * gd.GIB
+            return [gd.Item(dd.id, os.fspath(warm), 10 * gd.GIB, 3.0, "reclaimable", [])]
+        record = self.root / "fleet-cas-bytes.json"
+        record.write_text(json.dumps({"at": time.time(), "dev": dev, "bytes": 5 * gd.GIB}))
+        left = self.root / "cache-budget.json"
+        with mock.patch.object(gd, "load_snapshot", return_value=(0.0, stale)), \
+                mock.patch.object(gd, "FLEET_CAS_RECORD", record), \
+                mock.patch.object(gd, "CACHE_BUDGET_RECORD", left), \
+                mock.patch.object(gd, "fleet_cas_node_cap", return_value=0):
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], families=[dd], survey_effect=survey)
+            self.assertEqual(gd.BUDGET_WARM_DEVS, frozenset({dev}))  # the snapshot's 100 GiB put it over
+            row = rows[-1]["cache_budget"][0]
+            # fresh: 10 GiB measured plus the prune's 5, not 400 from the snapshot; 30% of 460 free is 118 GiB
+            # short of 20 GiB free, of which only the 10 GiB found reclaimable is the caches' to close
+            self.assertEqual((row["used_gib"], row["over_gib"]), (15.0, 10.0), row)
+            self.assertEqual(row["families_gib"], {"xcode-derived-data": 10.0, "fleet-cas": 5.0})
+            self.assertEqual(row["free_short_left_gib"], 108.0)
+            # the next pass counts only the shortfall beyond what this one could not close: 118 - 108 = 10 GiB
+            self.assertEqual(gd.read_budget_left(left), {dev: 108 * gd.GIB})
+            fs = gd.Fs(dev, "/", 20 * gd.GIB, 460 * gd.GIB, 120 * gd.GIB, 170 * gd.GIB)
+            pre = gd.cache_budget_state([dd], {dev: fs}, {os.fspath(warm): 10 * gd.GIB}, {},
+                                        unclosable=gd.read_budget_left(left))[dev]
+            self.assertEqual(pre["over"], 10 * gd.GIB)
+            # a report, --json and a plain --apply never apply it
+            for argv in (["report"], ["--json"], ["--apply"]):
+                gd.BUDGET_WARM_DEVS, gd.CACHE_BUDGET = frozenset(), {}
+                before = len(rows)
+                _, rows, _, _ = self._main_run(argv, families=[dd], survey_effect=survey)
+                self.assertEqual((gd.BUDGET_WARM_DEVS, gd.CACHE_BUDGET), (frozenset(), {}), argv)
+                self.assertNotIn("cache budget:", self.said, argv)
+                self.assertFalse(any("cache_budget" in r for r in rows[before:]), argv)
+
+    def test_a_stale_fleet_cas_record_is_measured_again_on_a_pass_with_no_pressure(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        if self.root.stat().st_dev != dev:
+            self.skipTest("the fake volume is HOME's; this temp dir is on another")
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        root = self.root / "xcode"
+        (root / "node-store/cas/00").mkdir(parents=True)
+        (root / "node-store/cas/00/obj").write_bytes(b"\0" * 8192)
+        (root / "cas/v1").mkdir(parents=True)
+        (root / "cas/v1/blob").write_bytes(b"\0" * 4096)
+        (root / "fleet-cas.env").write_text("FLEET_CAS_STORE=x\n")
+        record = self.root / "fleet-cas-bytes.json"
+        record.write_text(json.dumps({"at": time.time() - gd.FLEET_CAS_RECORD_MAX_AGE_S - 60, "dev": dev,
+                                      "bytes": gd.GIB}))  # the last capped pass, long ago
+        self.assertFalse(gd.fleet_cas_record_fresh(gd.read_fleet_cas_record(record)))
+        with mock.patch.object(gd, "FLEET_CAS_RECORD", record), mock.patch.object(gd, "FLEET_CAS_ROOT", root), \
+                mock.patch.object(gd, "CACHE_BUDGET_RECORD", self.root / "cache-budget.json"), \
+                mock.patch.object(gd, "load_snapshot", return_value=(0.0, {})):
+            # plenty free: no pressure. With build_caches_unwindowed off the pass returns "no pressure"; on (the
+            # fleet mini's default since #2150) every pass sweeps instead. Both refresh the record.
+            for unwindowed in (False, True):
+                record.write_text(json.dumps({"at": time.time() - gd.FLEET_CAS_RECORD_MAX_AGE_S - 60, "dev": dev,
+                                              "bytes": gd.GIB}))
+                _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=400.0,
+                                               policy={"build_caches_unwindowed": unwindowed})
+                if not unwindowed:
+                    self.assertEqual(rows[-1]["skipped"], "no pressure")
+                doc = gd.read_fleet_cas_record(record)
+                self.assertTrue(gd.fleet_cas_record_fresh(doc), unwindowed)  # the plan-only prune measured both again
+                self.assertEqual((doc["dev"], doc["bytes"]), (dev, 8192 + 4096))
+                self.assertTrue((root / "node-store/cas/00/obj").exists() and (root / "cas/v1/blob").exists())
+            fs = gd.Fs(dev, "/", 400 * gd.GIB, 460 * gd.GIB, 120 * gd.GIB, 170 * gd.GIB)
+            fam = gd.Family("cmux-seeds", self.root / "seeds", True, "")
+            fam.root.mkdir()
+            row = gd.cache_budget_state([fam], {dev: fs}, {})[dev]
+            self.assertEqual(row["families"], {"fleet-cas": 8192 + 4096})  # the CAS is counted again
+
     def test_a_pressure_apply_bounds_its_survey(self) -> None:
         """Every pressure --apply measures for at most pressure_measure_budget_s and judges until twice that, so it
         reaches its deletes inside the runner hook's bound; a report and a 0 budget keep the unbounded survey."""
@@ -12727,7 +12811,8 @@ class ActivityClockTest(unittest.TestCase):
 
 MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
                 "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
-                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN")
+                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN", "CACHE_BUDGET",
+                "BUDGET_WARM_DEVS")
 
 
 def keep_main_globals(stack: contextlib.ExitStack) -> None:
@@ -13081,6 +13166,15 @@ class FleetCasNodeCapTest(unittest.TestCase):
                 self.assertEqual(gd.fleet_cas_node_cap(root, prune), int(3.5 * gd.GIB))
             self.assertEqual(calls.read_text(), f"--apply --node-only {root}\n")
             self.assertIn("fleet-cas node store: removed 12 oldest files", out.getvalue())
+            # over the cache budget: both stores capped at the given size, and a removed local CAS counts too
+            prune.write_text("import json, os, sys\n"
+                             f"open({os.fspath(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                             "print(json.dumps({'node_store': 'removed 2 oldest files, 1.0 GiB', 'local_cas': 'removed',"
+                             f" 'local_cas_bytes': {6 * gd.GIB}, 'result': 'ok'}}))\n")
+            calls.unlink()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gd.fleet_cas_node_cap(root, prune, cap_gib=5.7), 7 * gd.GIB)
+            self.assertEqual(calls.read_text(), "--apply --cap-only --node-gib 5.7 --local-cas-gib 5.7\n")
             prune.write_text("print('not json')\n")
             self.assertEqual(gd.fleet_cas_node_cap(root, prune), 0)
             self.assertEqual(gd.fleet_cas_node_cap(root, Path(tmp) / "missing"), 0)
@@ -13362,6 +13456,238 @@ class DeadItemsTest(unittest.TestCase):
         self.assertTrue(old_dd.exists(), "not a dead family")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             gd.main(["--dead", "--pressure", "--no-snapshot"])
+
+
+class CacheBudgetTest(unittest.TestCase):
+    """The host cache budget: every build cache on a volume together under POLICY cache_budget."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.dev = self.root.stat().st_dev
+        self.fs = gd.Fs(self.dev, "/", 50 * gd.GIB, 100 * gd.GIB, 35 * gd.GIB, 45 * gd.GIB)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        keep_main_globals(stack)
+        stack.enter_context(mock.patch.object(gd, "process_evidence", return_value=([], "")))
+        gd._DISCOVERED.clear()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_family_ids_named_before_their_constants_match_them(self) -> None:
+        for fid in (gd.RUNNER_BUILD_FAMILY, gd.HQ_CACHE_FAMILY, *(f"journey-{s}" for s in gd.JOURNEY_SUBDIRS)):
+            self.assertIn(fid, gd.BUDGET_FAMILY_IDS)
+        self.assertLessEqual(gd.BUDGET_WARM_FAMILY_IDS, gd.BUDGET_FAMILY_IDS)
+
+    def test_state_counts_outermost_sizes_of_budget_families_and_the_fleet_cas(self) -> None:
+        seeds = gd.Family("cmux-seeds", self.root / "ci/seeds", True, "")
+        kept = gd.Family("cmux-kept-build", self.root / "ci", True, "")
+        other = gd.Family("projects", self.root / "projects", False, "")
+        for f in (seeds, kept, other):
+            f.root.mkdir(parents=True, exist_ok=True)
+        r = os.fspath(self.root)
+        sizes = {f"{r}/ci/seeds/a": 10 * gd.GIB, f"{r}/ci/seeds/a/inner": 9 * gd.GIB,  # inside a: counted once
+                 f"{r}/ci/derived-data": 12 * gd.GIB, f"{r}/projects/x": 50 * gd.GIB}
+        cas = {"at": 1000.0 - 600, "dev": self.dev, "bytes": 18 * gd.GIB}  # glaeda-fleet-cas-prune's last report
+        state = gd.cache_budget_state([seeds, kept, other], {self.dev: self.fs}, sizes, cas, now=1000.0)
+        row = state[self.dev]
+        self.assertEqual(row["used"], 40 * gd.GIB)
+        self.assertEqual(row["families"], {"cmux-seeds": 10 * gd.GIB, "cmux-kept-build": 12 * gd.GIB,
+                                           "fleet-cas": 18 * gd.GIB})
+        self.assertEqual(row["budget"], 35 * gd.GIB)
+        self.assertEqual(row["over"], 40 * gd.GIB - int(35 * gd.GIB * gd.BUDGET_STOP_SHARE))
+        # under the budget: nothing to give back; a fleet-cas report older than its bound is not counted
+        state = gd.cache_budget_state([seeds, kept], {self.dev: self.fs}, sizes, cas,
+                                      now=cas["at"] + gd.FLEET_CAS_RECORD_MAX_AGE_S + 1)
+        self.assertEqual((state[self.dev]["used"], state[self.dev]["over"]), (22 * gd.GIB, 0))
+
+    def test_a_zero_budget_turns_it_off(self) -> None:
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        gd.POLICY["cache_budget"] = "0"
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {f"{self.root}/a": 99 * gd.GIB}, {}), {})
+
+    def test_over_the_budget_warm_windows_drop_to_an_hour_and_other_families_keep_theirs(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "", min_idle_hours=12)
+        lib = gd.Family("library-caches", self.root, True, "", min_idle_hours=12)
+        gd.ACTIVITY_MODE = "pressure"
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), 12)
+        gd.BUDGET_WARM_DEVS = frozenset({self.dev})
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), gd.BUDGET_IDLE_HOURS)
+        self.assertEqual(gd.item_window(lib, self.root / "a", 6), 12)
+        gd.ACTIVITY_MODE = None  # a report or a sweep never spends the budget
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), 12)
+
+    def test_apply_takes_warm_state_by_value_and_stops_once_under_the_budget(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "", min_idle_hours=12, build_output=True)
+        for name, age in (("young", 2), ("older", 3), ("oldest", 4), ("fresh", 0.2)):
+            make(self.root / name, mib=2, age_hours=age)
+        gd.ACTIVITY_MODE = "pressure"
+        gd.BUDGET_WARM_DEVS = frozenset({self.dev})
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 3 * 1024 * 1024, "families": {}}}
+        receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
+        self.addCleanup(receipt.unlink, missing_ok=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([dd], 6, 0)
+            verdicts = {Path(i.path).name: i.verdict for i in items}
+            self.assertEqual(verdicts, {"young": "reclaimable", "older": "reclaimable", "oldest": "reclaimable",
+                                        "fresh": "recent"})
+            gd.apply(items, {dd.id: dd}, receipt, None, 6)
+        left = sorted(p.name for p in self.root.iterdir())
+        self.assertEqual(left, ["fresh", "young"])  # the two idle longest went; then the volume was under
+
+    def test_rows_name_the_mount_and_families_in_gib(self) -> None:
+        gd.CACHE_BUDGET = {self.dev: {"used": 40 * gd.GIB, "budget": 35 * gd.GIB, "over": 8 * gd.GIB,
+                                      "mount": "/", "families": {"a": 1 * gd.GIB, "b": 39 * gd.GIB}}}
+        self.assertEqual(gd.cache_budget_rows(), [{"mount": "/", "used_gib": 40.0, "budget_gib": 35.0,
+                                                   "over_gib": 8.0, "free_short_gib": 0.0, "free_short_left_gib": 0.0,
+                                                   "families_gib": {"b": 39.0, "a": 1.0}}])
+
+    def test_a_small_disk_under_its_free_share_gives_back_more_than_the_share_asks(self) -> None:
+        # a 228 GB mini: 30 GiB of caches is under the 35% share, but 8 GiB free is 60 GiB short of 30% free
+        fs = gd.Fs(self.dev, "/", 8 * gd.GIB, 228 * gd.GIB, 100 * gd.GIB, 150 * gd.GIB)
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        sizes = {f"{self.root}/a": 30 * gd.GIB}
+        row = gd.cache_budget_state([fam], {self.dev: fs}, sizes, {})[self.dev]
+        self.assertEqual(row["free_short"], int(228 * gd.GIB * 0.30) - 8 * gd.GIB)
+        self.assertEqual(row["over"], 30 * gd.GIB)  # before the survey: never more than the caches hold
+        # after the survey: only what it found reclaimable in the budget's families counts; the rest is reported
+        row = gd.cache_budget_state([fam], {self.dev: fs}, sizes, {}, reclaimable={self.dev: 5 * gd.GIB})[self.dev]
+        self.assertEqual(row["over"], 5 * gd.GIB)
+        self.assertEqual(row["free_short_left"], row["free_short"] - 5 * gd.GIB)
+        # nothing reclaimable: the volume is not over at all, so the next pass is no forced pressure pass
+        row = gd.cache_budget_state([fam], {self.dev: fs}, sizes, {}, reclaimable={})[self.dev]
+        self.assertEqual((row["over"], row["free_short_left"]), (0, row["free_short"]))
+        gd.POLICY["cache_budget_free"] = "0"  # the share alone: under it, nothing to give back
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: fs}, sizes, {})[self.dev]["over"], 0)
+
+    def test_reclaimable_counts_only_reclaimable_budget_family_items_once(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "")
+        r = os.fspath(self.root)
+        items = [gd.Item("xcode-derived-data", f"{r}/a", 4 * gd.GIB, 3.0, "reclaimable", []),
+                 gd.Item("xcode-derived-data", f"{r}/a/b", 1 * gd.GIB, 3.0, "reclaimable", []),
+                 gd.Item("xcode-derived-data", f"{r}/c", 2 * gd.GIB, 0.1, "recent", []),
+                 gd.Item("library-caches", f"{r}/d", 9 * gd.GIB, 30.0, "reclaimable", [])]
+        self.assertEqual(gd.cache_budget_reclaimable(items, [dd]), {self.dev: 4 * gd.GIB})
+
+    def test_outermost_compares_path_components(self) -> None:
+        self.assertEqual(gd._outermost(["/r/a", "/r/a-1", "/r/a/b", "/r/a-1/c", "/r/ab"]), ["/r/a", "/r/a-1", "/r/ab"])
+        sizes = {"/r/a": 1, "/r/a-1": 2, "/r/a/b": 4}
+        fam = gd.Family("cmux-seeds", Path("/r"), True, "")
+        with mock.patch.object(Path, "stat", return_value=os.stat_result((0, 0, 7, 0, 0, 0, 0, 0, 0, 0))):
+            self.assertEqual(gd._budget_dev_bytes([fam], sizes), {7: {"cmux-seeds": 3}})
+
+    def test_job_cache_media_slots_and_tokenless_admission_roots_keep_their_windows(self) -> None:
+        gd.ACTIVITY_MODE, gd.BUDGET_WARM_DEVS = "pressure", frozenset({self.dev})
+        self.assertNotIn("cmux-job-cache", gd.BUDGET_WARM_FAMILY_IDS)
+        job = gd.Family("cmux-job-cache", self.root, True, "", min_idle_hours=gd.DEFAULT_AGE_HOURS)
+        # its own family window, not the budget's BUDGET_IDLE_HOURS (both 1 h since #2138, so ask for 6 h)
+        self.assertEqual(gd.item_window(job, self.root / "u/DerivedData", 6), gd.idle_window(job, 6))
+        adm = gd.Family(gd.CANONICAL_ADMISSION, self.root, True, "", min_idle_hours=gd.CANONICAL_ADMISSION_IDLE_HOURS)
+        path = self.root / "cmux-ci" / "DerivedData"
+        capacity = self.root / "capacity"
+        capacity.mkdir()
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity):
+            self.assertEqual(gd.item_window(adm, path, 6), gd.idle_window(adm, 6))  # no token file: its own window
+            item = gd.Item(adm.id, os.fspath(path), gd.GIB, 3.0, "reclaimable", [])
+            self.assertFalse(gd.budget_only(adm, item, 6))
+            (capacity / "root-1.token").write_text("")
+            self.assertEqual(gd.item_window(adm, path, 6), gd.BUDGET_IDLE_HOURS)  # the token protocol holds it
+            self.assertTrue(gd.budget_only(adm, item, 6))
+        dd = gd.Family("xcode-derived-data", self.root, True, "", min_idle_hours=12)
+        slot = gd.Item(dd.id, os.fspath(self.root / "cmux-ci-media-slot0-base"), gd.GIB, 3.0, "reclaimable", [])
+        with mock.patch.object(gd, "media_tour_host", return_value=True):
+            self.assertFalse(gd.budget_only(dd, slot, 6))  # a warm tour slot goes only under the floor hold
+            self.assertEqual(gd.item_window(dd, Path(slot.path), 6), float("inf"))
+        self.assertTrue(gd.budget_only(dd, slot, 6))  # no media host: an ordinary DerivedData
+
+    def test_budget_only_items_take_fresh_process_evidence_at_apply(self) -> None:
+        for fid in ("xcode-derived-data", "journey-builds"):
+            with self.subTest(fid):
+                root = self.root / fid
+                fam = gd.Family(fid, root, True, "", min_idle_hours=12, build_output=True)
+                make(root / "warm", mib=1, age_hours=3)
+                gd.ACTIVITY_MODE, gd.BUDGET_WARM_DEVS = "pressure", frozenset({self.dev})
+                gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": gd.GIB, "families": {}}}
+                receipt = self.root.parent / f"{self.root.name}-{fid}-receipt.jsonl"
+                self.addCleanup(receipt.unlink, missing_ok=True)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    items = gd.survey([fam], 6, 0)
+                self.assertEqual([i.verdict for i in items], ["reclaimable"])
+                calls = []
+
+                def evidence(path=os.fspath(root / "warm")):  # a build opens it after the pass's first look
+                    calls.append(1)
+                    return [], ("" if len(calls) == 1 else f"xcodebuild -derivedDataPath {path}")
+                with mock.patch.object(gd, "process_evidence", side_effect=evidence), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    gd.apply(items, {fam.id: fam}, receipt, None, 6)
+                self.assertGreaterEqual(len(calls), 2)
+                self.assertTrue((root / "warm").exists())
+                self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_fleet_cas_cap_records_what_both_stores_hold_after_it(self) -> None:
+        root, prune, record = self.root / "xcode", self.root / "prune", self.root / "fleet-cas-bytes.json"
+        root.mkdir()
+        (root / "fleet-cas.env").write_text("FLEET_CAS_STORE=x\n")
+        calls = self.root / "calls"
+        prune.write_text("import json, sys\n"
+                         f"open({os.fspath(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                         "print(json.dumps({'node_store': 'removed 3 oldest files, 2.0 GiB', 'node_store_bytes': "
+                         f"{10 * gd.GIB}, 'node_store_freed_bytes': {2 * gd.GIB}, 'local_cas': 'within budget', "
+                         f"'local_cas_bytes': {3 * gd.GIB}, 'result': 'ok'}}))\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.fleet_cas_node_cap(root, prune, record=record), 2 * gd.GIB)
+        doc = gd.read_fleet_cas_record(record)
+        self.assertEqual((doc["dev"], doc["bytes"]), (root.stat().st_dev, 11 * gd.GIB))  # 10 - 2 + 3
+        self.assertLess(time.time() - doc["at"], 60)
+        # over the budget: --cap-only (no sweep, no gc) at 2.5% of the volume; with no new record, what it freed
+        # comes off "over"
+        gd.ACTIVITY_MODE = "pressure"
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 5 * gd.GIB, "families": {}}}
+        with mock.patch.object(gd, "fleet_cas_node_cap", return_value=2 * gd.GIB) as cap, \
+                mock.patch.object(gd, "FLEET_CAS_RECORD", record):
+            self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 2 * gd.GIB)
+        self.assertEqual(cap.call_args.kwargs["cap_gib"], 2.5)
+        self.assertEqual(gd.CACHE_BUDGET[self.dev]["over"], 3 * gd.GIB)
+        calls.unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.fleet_cas_node_cap(root, prune, cap_gib=2.5, record=record)
+        self.assertEqual(calls.read_text(), "--apply --cap-only --node-gib 2.5 --local-cas-gib 2.5\n")
+        gd.CACHE_BUDGET = {}  # not over: no capped run
+        with mock.patch.object(gd, "fleet_cas_node_cap") as cap:
+            self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 0)
+        cap.assert_not_called()
+
+    def test_the_cas_cap_credits_what_the_stores_shrank_by_since_the_counted_record(self) -> None:
+        root, record = self.root / "xcode", self.root / "fleet-cas-bytes.json"
+        root.mkdir()
+        record.write_text(json.dumps({"at": time.time() - 600, "dev": self.dev, "bytes": 20 * gd.GIB}))
+        gd.ACTIVITY_MODE = "pressure"
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 30 * gd.GIB,
+                                      "families": {"fleet-cas": 20 * gd.GIB}}}
+
+        def cap(*args, **kw):  # freed 2 GiB, but a writer build had emptied its local CAS since: 5 GiB are left
+            record.write_text(json.dumps({"at": time.time(), "dev": self.dev, "bytes": 5 * gd.GIB}))
+            return 2 * gd.GIB
+        with mock.patch.object(gd, "fleet_cas_node_cap", side_effect=cap), \
+                mock.patch.object(gd, "FLEET_CAS_RECORD", record):
+            self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 2 * gd.GIB)
+        self.assertEqual(gd.CACHE_BUDGET[self.dev]["over"], 15 * gd.GIB)  # 30 - (20 - 5)
+
+    def test_records_holding_infinity_or_nan_read_as_absent(self) -> None:
+        path = self.root / "record.json"
+        for body in ('{"at": 1e300, "dev": 1, "bytes": Infinity}', '{"at": NaN, "dev": 1, "bytes": 1}',
+                     '{"at": 1, "dev": Infinity, "bytes": 1}', '{"at": true, "dev": 1, "bytes": 1}', "[]", "x"):
+            path.write_text(body)
+            self.assertEqual(gd.read_fleet_cas_record(path), {}, body)
+        now = time.time()
+        for body in (f'{{"at": {now}, "left": {{"1": Infinity}}}}', '{"at": Infinity, "left": {}}',
+                     f'{{"at": {now}, "left": {{"1": NaN}}}}', '{"at": NaN, "left": {"1": 5}}'):
+            path.write_text(body)
+            self.assertEqual(gd.read_budget_left(path, now=now), {}, body)
+        # cache_budget_state never sees one: an infinite record is no record
+        path.write_text('{"at": 1, "dev": 1, "bytes": Infinity}')
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {}, gd.read_fleet_cas_record(path)), {})
 
 
 if __name__ == "__main__":

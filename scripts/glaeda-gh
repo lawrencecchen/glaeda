@@ -3673,6 +3673,15 @@ class Daemon:
         level, text, data = stale
         if not policy.get("staleRestart", True):
             return stale
+        fresh = (getattr(self, "fresh_waited", None) or {}).get(data.get("kind"))
+        if isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER:
+            # The daemon reads its other waited keys (one of them is FRESH s old): this one key is stale, and a restart
+            # would only drop every land judgment in flight. huge-blue, 2026-11-18: six valve restarts in six hours,
+            # each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s), each starting the 596-land queue over. Its read
+            # goes first instead (nudged), and the alarm stands.
+            if data.get("key"):
+                self.nudged.add(str(data["key"]))
+            return level, text, {**data, "valve": "one_key", "freshest": int(fresh)}
         up = self.now - (self.started_tick if self.started_tick is not None else self.now)
         if up < STALE_DATA_AFTER:
             return level, text, {**data, "valve": "young", "up": int(up)}
@@ -5679,14 +5688,20 @@ class Daemon:
         self.status = status
         return status
 
-    def land_busy(self) -> bool:
-        """A land job (an explain, a merge, an update-branch) is running: a re-exec waits for it, so the new daemon
-        never sends a step beside one the old one still runs."""
+    def land_busy(self, drain: bool = False) -> bool:
+        """A land step (a merge, an update-branch: a claimed action) is running: a re-exec waits for it, so the new
+        daemon never sends a step beside one the old one still runs. A judgment alone (merge_hold explain, minutes at
+        times) sends nothing: a re-exec drops it and the next daemon judges that entry first (judge_order), where waiting
+        for it hit REEXEC_DRAIN_MAX (huge-blue, 2026-11-18: 08:42, 09:20, 10:17, 11:10Z). DRAIN (an update is waiting):
+        from now on no judgment claims a step (LandQueue.draining)."""
         q = self.land_queue
         if q is None:
             return False
         q.reap()
-        return bool(q.jobs)
+        with q.lock:
+            if drain:
+                q.draining = True
+            return any((q.entries.get(k) or {}).get("state") == "acting" for k in q.jobs)
 
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
@@ -6116,6 +6131,7 @@ class Daemon:
         (STALE_DATA_AFTER), where an idle PR's old data is only its backoff."""
         oldest: dict[str, float | None] = {kind: None for kind in CYCLES}
         self.stale_waited = {kind: None for kind in CYCLES}
+        self.fresh_waited: dict[str, float | None] = {kind: None for kind in CYCLES}  # the newest waited data's age
         self.stale_waited_key: dict[str, str] = {}
         # A waited key this daemon has not seen yet is watched since its wait began (waitBegan) at the latest: after a
         # restart, a target never read successfully (504s since it was registered) keeps its age instead of starting
@@ -6140,6 +6156,8 @@ class Daemon:
             age_s = max(0.0, self.now - seen)
             oldest[kind] = max(oldest[kind] or 0.0, age_s)
             blocked = min(age_s, self.now - self.waited_since[e["key"]]) if self.waited(e) else 0.0
+            if self.waited(e) and (self.fresh_waited[kind] is None or age_s < self.fresh_waited[kind]):
+                self.fresh_waited[kind] = age_s
             if self.waited(e) and blocked >= (self.stale_waited[kind] or 0.0):
                 self.stale_waited[kind] = blocked
                 self.stale_waited_key[kind] = e["key"]
@@ -8030,6 +8048,14 @@ LAND_SNAPSHOT_SCHEMA = "merge-hold-rollup-snapshot/v1"
 LAND_SNAPSHOT_DIR = "snapshots"
 LAND_SNAPSHOT_MAX_AGE = 300.0
 LAND_SNAPSHOT_WAIT = 120.0
+# Judgments run on the land workers and are handed one only when one is free (LandQueue.judge), least recently judged
+# first (LandQueue.judge_order). huge-blue, 2026-11-18: every due judgment went onto the pool's own queue at once (596
+# lands, 4 workers), hours deep; each update's re-exec (glaeda releases land 10-60 min apart) dropped that queue and
+# the next daemon judged from the top again, so cmux#45661 (SHIP, CLEAN, 60/60 green) went 7 h unjudged, its history
+# ending at snapshot_missing every pass: every due land waited on its snapshot at once, so the reads they were put
+# first for (Daemon.snapshot_waits) could not come within LAND_SNAPSHOT_WAIT. Ahead of the workers at most this many
+# per worker wait on their snapshot reads.
+LAND_SNAPSHOT_AHEAD = 1
 # The head a judgement pins is the cache's only when the cache read the PR after the entry was unparked or the login's
 # latch last cleared (LandQueue.fresh_head). huge-blue, 2026-11-18 09:43Z: parked on the latch, the daemon read
 # nothing for 37 min; on resume glaeda#2140 waited on, then judged, its old head 401ccf880760 though bc1601b6 had been
@@ -8424,6 +8450,8 @@ class LandQueue:
         self.entries: dict[str, dict] = {}
         self.jobs: dict[str, Any] = {}
         self.touched: dict[str, float] = {}
+        self.draining = False  # an update waits to re-exec: no judgment claims a step (claim; Daemon.land_busy)
+        self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
         self.now = time.time()
         self.load()
@@ -8454,6 +8482,7 @@ class LandQueue:
             if not isinstance(e, dict) or not isinstance(e.get("key"), str) or e.get("state") not in LAND_STATES \
                     or not isinstance(e.get("repo"), str) or not str(e.get("number", "")).isdigit():
                 continue
+            e.pop("snapshotWait", None)  # a fresh daemon's waits start within its own cap (judge)
             if e.get("state") in ("judging", "acting"):
                 claimed = e.get("action")
                 self.history(e, "restart", note="re-judged after a restart",
@@ -8574,7 +8603,9 @@ class LandQueue:
         if self.refuse():
             return
         latch = self.latch_held()
-        for key in list(self.entries):
+        self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
+                                 and isinstance(e.get("snapshotWait"), dict)}
+        for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
                 if e["state"] in LAND_DONE:
@@ -8849,14 +8880,23 @@ class LandQueue:
                             self.history(e, "error", error=describe(err))
                             self.save(e)
 
+    def workers(self) -> int:
+        return int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, 16))
+
+    def judge_order(self, key: str) -> float:
+        """The tick's order: the entry judged longest ago first (never judged: first of all), so a free worker goes to
+        the land that waited longest, and a restart, which keeps each entry's last judgment on disk, does not start
+        over from the same few."""
+        at = (self.entries[key].get("explain") or {}).get("at")
+        return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+
     def submit(self, key: str, fn: Callable[..., None], *args: Any) -> None:
         if self.inline:
             fn(*args)
             return
         if self.pool is None:
             import concurrent.futures
-            workers = int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, 16))
-            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="land")
+            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.workers(), thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
 
     def keep_watching(self, e: dict) -> None:
@@ -8921,9 +8961,8 @@ class LandQueue:
         if not data:
             since = e.setdefault("noDataSince", self.now)
             self.nudge(e["key"])
-            if self.now - since >= LAND_NO_DATA_AFTER:
+            if self.now - since >= LAND_NO_DATA_AFTER and self.judge(e, "", fp):  # merge_hold reads the head
                 e.pop("noDataSince", None)
-                self.judge(e, "", fp)  # merge_hold reads the head itself
             return
         e.pop("noDataSince", None)
         running = land_checks_running(data, head)
@@ -8941,8 +8980,8 @@ class LandQueue:
                     e["updatedHead"] = head  # this queue's own base merge made it (update_again)
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
             elif woke:
-                self.history(e, "head_timeout", before=w.get("before"))
-                self.judge(e, "", fp)  # merge_hold reads the head itself: the cache never showed the new one
+                if self.judge(e, "", fp):  # merge_hold reads the head itself: the cache never showed the new one
+                    self.history(e, "head_timeout", before=w.get("before"))
             elif float((c or {}).get("fetchedAt") or 0) < float(w.get("since") or 0) or self.now - float(
                     w.get("nudgedAt") or 0) >= NUDGE_MIN:
                 w["nudgedAt"] = self.now
@@ -8989,6 +9028,8 @@ class LandQueue:
             return False
         if not self.reads_upstream():
             return False  # a host with its own login: the nudge (and the stale valve) refresh it
+        if len(self.jobs) >= self.workers():
+            return True  # read on a free worker, a later tick; judged after it
         e["refresh"] = {"at": self.now, "age": round(self.now - at)}
         self.save(e)
         self.submit(e["key"], self.refresh_job, e["key"])
@@ -9056,29 +9097,33 @@ class LandQueue:
             return None, "partial"
         return {**snap, "dataAt": at}, ""
 
-    def snapshot_wait(self, e: dict, sha: str) -> bool:
-        """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged)."""
+    def snapshot_wait(self, e: dict, sha: str, free: bool = True) -> bool:
+        """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged). A wait
+        that ran out with no worker FREE stays (True): it is judged live when one frees, never waits a second time."""
         _, why = self.snapshot(e["key"], sha)
         w = e.get("snapshotWait") or {}
         if why != "wait":
             e.pop("snapshotWait", None)
+            self.snapshot_waiting.discard(e["key"])
             return False
         if w.get("sha") != sha:
             w = e["snapshotWait"] = {"sha": sha, "since": self.now}
+            self.snapshot_waiting.add(e["key"])
             self.history(e, "snapshot_wait", head=sha[:12])
             self.nudge(e["key"])
             self.save(e)
-        if self.now - float(w.get("since") or 0) < LAND_SNAPSHOT_WAIT:
+        if self.now - float(w.get("since") or 0) < LAND_SNAPSHOT_WAIT or not free:
             return True
         e.pop("snapshotWait", None)
+        self.snapshot_waiting.discard(e["key"])
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
-    def fresh_head(self, e: dict, sha: str) -> str | None:
+    def fresh_head(self, e: dict, sha: str, free: bool = True) -> str | None:
         """SHA when a judgement may pin it, "" when merge_hold must read the head itself, None while E waits (nudged)
         for a read of its PR made after it was unparked or the login's latch last cleared (LAND_FRESH_WAIT): while
         either held, the daemon read nothing for it. Only a head the cache gave is checked: a pin merge_hold named (a
-        repin) is its own read."""
+        repin) is its own read. Past the wait with no worker FREE it stays None: unpinned on the next free one."""
         c = self.cache_of(e["key"]) or {}
         if not sha or str(((c.get("data") or {}).get("headRefOid")) or "").lower() != sha:
             e.pop("staleHead", None)
@@ -9105,23 +9150,36 @@ class LandQueue:
             if read_since(c):
                 e.pop("staleHead", None)
                 return sha if head == sha else None  # a new head: consider() judges it on its next pass
-        if self.now - float(w.get("since") or 0) < LAND_FRESH_WAIT:
+        if self.now - float(w.get("since") or 0) < LAND_FRESH_WAIT or not free:  # (unpinned on a free worker)
             return None
         e.pop("staleHead", None)
         self.history(e, "head_unpinned", head=sha[:12])
         return ""
 
-    def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> None:
-        pin = self.fresh_head(e, sha)
+    def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> bool:
+        """Judge E at SHA on a free worker; True when it was handed one. None free: it stays as it is and is considered
+        again next tick (the tick goes least recently judged first), so the pool never queues. Ahead of the workers at
+        most LAND_SNAPSHOT_AHEAD per worker start a snapshot wait (each puts its PR's read first); past that, one whose
+        snapshot is ready (or that needs none) still takes a free worker, and the rest wait without nudging a read."""
+        pin = self.fresh_head(e, sha, len(self.jobs) < self.workers())
         if pin is None:
-            return  # judged once the daemon has read the PR since it was unparked or the latch cleared
+            return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
-        if self.snapshot_wait(e, sha):
-            return  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
+        workers = self.workers()
+        free = len(self.jobs) < workers
+        mine = (e.get("snapshotWait") or {}).get("sha") == sha
+        if not mine and len(self.jobs) + len(self.snapshot_waiting) >= workers * (1 + LAND_SNAPSHOT_AHEAD):
+            if not free or self.snapshot(e["key"], sha)[1] == "wait":
+                return False
+        elif self.snapshot_wait(e, sha, free):
+            return False  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
+        if not free:
+            return False
         head = str((((self.cache_of(e["key"]) or {}).get("data")) or {}).get("headRefOid") or "").lower()
         e.update(state="judging", seen=fp, seenHead=head, judging={"sha": sha, "at": self.now, "counts": counts})
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
+        return True
 
     # -- a job: one judgment and the step it names (a worker thread)
 
@@ -9290,8 +9348,11 @@ class LandQueue:
         return s["count"] >= (LAND_RETRY_STREAK_STOP if retry else LAND_STREAK_STOP)
 
     def claim(self, e: dict, kind: str, **args: Any) -> None:
-        """Written before the step starts: a restart sees it and judges again instead of running it on its own."""
+        """Written before the step starts: a restart sees it and judges again instead of running it on its own. None
+        while an update waits to re-exec (draining): the entry is queued again, and the next daemon judges it."""
         self.check(e)
+        if self.draining:
+            raise LandCancelled("an update waits to re-exec")
         e["action"] = {"kind": kind, "claimedAt": self.now, "head": e.get("head"), **args}
         e["state"] = "acting"
         self.save(e)
@@ -10371,7 +10432,8 @@ def serve(foreground_ok: bool = False) -> int:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
                 daemon.restart_self()
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
-            due = reexec_due(me.stat().st_mtime != stamp, daemon.land_busy(), daemon.reexec_waiting, time.monotonic())
+            changed = me.stat().st_mtime != stamp
+            due = reexec_due(changed, daemon.land_busy(drain=changed), daemon.reexec_waiting, time.monotonic())
             if due == "defer":
                 if not daemon.reexec_waiting:
                     log({"event": "reexec-deferred", "why": "a land step is running; no new one starts until it ends"})

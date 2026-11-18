@@ -13931,6 +13931,26 @@ class SpendAlarmTest(Base):
         self.daemon.stale_valve(("warn", "x", {"kind": "pr"}), self.daemon.policy["alarms"])
         self.assertIsNotNone(self.daemon.valve_due, "past the cooldown the valve acts again")
 
+    def test_the_valve_never_restarts_for_one_stale_key_while_other_waited_keys_are_read(self) -> None:
+        # huge-blue, 2026-11-18: six valve restarts in six hours, each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s,
+        # 16 ticks) while the daemon read the rest, and each threw away the land queue's judgments in flight.
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 3963.0}, {"pr": "pr:o/r#5"}
+        self.daemon.fresh_waited = {"pr": 30.0}
+        for i in range(3):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNone(self.daemon.valve_due)
+        self.assertIn("pr:o/r#5", self.daemon.nudged)  # its read goes first instead
+        verdict = self.daemon.stale_valve(("warn", "x", {"kind": "pr", "key": "pr:o/r#5"}), self.daemon.policy["alarms"])
+        self.assertEqual((verdict[2]["valve"], verdict[2]["freshest"]), ("one_key", 30))
+        # nothing read anywhere (every waited key old): that is a stuck daemon, and the valve still acts
+        self.daemon.fresh_waited = {"pr": float(gg.STALE_DATA_AFTER + 1)}
+        self.daemon.now += gg.TICK
+        self.daemon.check_alarms()
+        self.assertIsNotNone(self.daemon.valve_due)
+
     def test_the_valve_waits_for_a_daemon_to_have_had_its_chance_and_obeys_policy(self) -> None:
         self.policy()
         stale = ("warn", "x", {"kind": "pr"})
@@ -17981,6 +18001,102 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
 
+    class FakePool:
+        """A worker pool whose jobs run only when a test says so: what was handed to it, in order."""
+
+        class Job:
+            def __init__(self) -> None:
+                self.finished = False
+
+            def done(self) -> bool:
+                return self.finished
+
+            def exception(self) -> None:
+                return None
+
+        def __init__(self) -> None:
+            self.handed: list[tuple[str, Any]] = []
+
+        def submit(self, fn: Any, *args: Any) -> Any:
+            job = self.Job()
+            self.handed.append((args[0], job))
+            return job
+
+        def keys(self) -> list[str]:
+            return [k for k, _ in self.handed]
+
+    def pooled(self, workers: int) -> "LandTest.FakePool":
+        self.w.config["workers"] = workers
+        self.q = self.queue()
+        self.q.inline = False
+        self.q.pool = pool = self.FakePool()
+        return pool
+
+    def test_judgments_wait_for_a_free_worker_instead_of_queueing_on_the_pool(self):
+        # huge-blue, 2026-11-18: 596 queued lands, 4 workers. Every judgment went onto the pool's own queue at once, so
+        # the queue was hours deep; each update's re-exec (10-60 min apart) dropped it and judged from the top again,
+        # and cmux#45661 (SHIP, CLEAN, 60/60 green) sat unjudged for 7 h behind snapshot_missing.
+        pool = self.pooled(2)
+        for n in range(1, 6):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"
+            self.snaps[key] = {"schema": gg.ROLLUP_SCHEMA, "key": key, "head": LA, "fp": "F", "complete": True,
+                               "readAt": self.t, "rollup": {"nodes": self.NODES}}
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.tick()
+        self.assertEqual(len(pool.handed), 2)  # never more jobs than workers
+        self.assertEqual(len(self.q.jobs), 2)
+        pool.handed[0][1].finished = True
+        self.tick()
+        self.assertEqual(len(pool.handed), 3)
+        self.assertEqual(len(self.q.jobs), 2)
+
+    def test_a_restart_judges_the_longest_unjudged_land_first(self):
+        pool = self.pooled(5)
+        for n in range(1, 6):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"
+            self.snaps[key] = {"schema": gg.ROLLUP_SCHEMA, "key": key, "head": LA, "fp": "F", "complete": True,
+                               "readAt": self.t, "rollup": {"nodes": self.NODES}}
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.assertEqual(len(pool.handed), 5)
+        for n in range(1, 6):  # judged a minute ago, but #5 not for 7 h; all being judged when the re-exec came
+            e = self.q.entries[f"pr:o/r#{n}"]
+            e["explain"] = {"at": self.t - (7 * 3600 if n == 5 else 60), "ok": False}
+            self.q.save(e)
+        pool = self.pooled(2)  # the re-exec: a fresh queue off the same disk
+        self.tick()
+        self.assertEqual(pool.keys()[0], "pr:o/r#5")
+        self.assertEqual(len(pool.handed), 2)
+
+    def test_snapshot_waits_are_capped_and_an_expired_wait_keeps_its_place_while_workers_are_busy(self):
+        pool = self.pooled(1)
+        for n in range(1, 5):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"  # no snapshot: each judgment waits for the daemon's read first
+            self.land(f"o/r#{n}")
+        self.tick()
+        waiting = [k for k, e in self.q.entries.items() if e.get("snapshotWait")]
+        self.assertEqual(len(waiting), 2)  # one per worker, one ahead: not all 4 (each nudges a read)
+        self.assertEqual(self.w.nudged.count("pr:o/r#3") + self.w.nudged.count("pr:o/r#4"), 0)
+        self.tick(gg.LAND_SNAPSHOT_WAIT + 1)
+        self.assertEqual(len(pool.handed), 1)  # the first expired wait judged live in the same pass
+        other = [k for k in waiting if k != pool.keys()[0]][0]
+        events = [h.get("event") for h in self.q.entries[other]["history"]]
+        self.assertEqual((events.count("snapshot_wait"), events.count("snapshot_missing")), (1, 0))
+        self.tick()
+        self.assertEqual(len(pool.handed), 1)
+        pool.handed[0][1].finished = True
+        self.tick()
+        self.assertEqual(pool.keys()[1], other)  # the next free worker goes to it, no second two-minute wait
+        events = [h.get("event") for h in self.q.entries[other]["history"]]
+        self.assertEqual((events.count("snapshot_wait"), events.count("snapshot_missing")), (1, 1))
+
     def test_no_wait_for_a_partial_snapshot_an_upstream_host_or_a_rest_read(self):
         for setup in ("partial", "upstream", "rest"):
             with self.subTest(setup):
@@ -19309,11 +19425,31 @@ class LandTest(Base):
         self.assertFalse(self.daemon.land_busy())
         fut = mock.Mock()
         fut.done.return_value = False
-        self.daemon.land_queue.jobs["pr:o/r#1"] = fut
+        q = self.daemon.land_queue
+        q.jobs["pr:o/r#1"] = fut
+        q.entries["pr:o/r#1"] = {"key": "pr:o/r#1", "state": "acting"}
         self.assertTrue(self.daemon.land_busy())
         fut.done.return_value = True
         fut.exception.return_value = None
         self.assertFalse(self.daemon.land_busy())
+
+    def test_reexec_drops_a_running_judgment_and_no_judgment_claims_a_step_after_it(self):
+        # huge-blue, 2026-11-18: merge_hold explains run for minutes, so every update waited REEXEC_DRAIN_MAX (300 s,
+        # no new land step meanwhile) and then re-executed anyway. A judgment sends nothing: the re-exec need not wait.
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        fut = mock.Mock()
+        fut.done.return_value = False
+        q.jobs["pr:o/r#1"] = fut
+        q.entries["pr:o/r#1"] = e = {"key": "pr:o/r#1", "state": "judging"}
+        self.assertFalse(self.daemon.land_busy())
+        self.assertFalse(q.draining)
+        self.assertFalse(self.daemon.land_busy(drain=True))
+        self.assertTrue(q.draining)
+        with self.assertRaises(gg.LandCancelled):
+            q.claim(e, "merge")
+        self.assertNotIn("action", e)
 
     def test_daemon_tick_runs_the_land_pass_only_once_land_exists(self):
         self.daemon.land_tick()

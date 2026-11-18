@@ -19316,6 +19316,194 @@ class LandTest(Base):
         self.assertEqual(e["stop"]["next"], "glaeda-gh land o/r#2 && glaeda-gh land o/r#1 --after o/r#2")
         self.assertIn("o/r#2, which it lands after, stayed stopped (block", e["stop"]["reason"])
 
+    # The review of glaeda#2174: each of these left a land without a bound.
+
+    def stop_o_r_2(self, why: str = "BLOCK") -> None:
+        rc, doc = refusal("block", LC, {"kind": "stop", "stop": "block", "why": why})
+        self.w.answers.append((rc, {**doc, "number": "2", "action": {**doc["action"], "number": 2}}))
+
+    def test_alternating_waits_share_one_budget_per_head(self):
+        # a review running while reads flap unreadable: wait_comment, retry, wait_comment... each used to start the
+        # other's budget again, so neither deadline ever came
+        self.pr(LA)
+        self.land()
+        review = refusal("review_running", LA, {"kind": "wait_comment", "match": "SHIP|BLOCK", "timeout_s": 600})
+        unread = refusal("unreadable", LA, {"kind": "retry", "after_s": 60})
+        self.w.answers += [review, unread] * 6
+        e = self.tick()
+        for _ in range(8):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual(e["state"], "stopped", e.get("waitBudget"))
+        self.assertIn(e["stop"]["code"], ("wait_comment_deadline", "retry_deadline"))
+        self.assertGreaterEqual(self.t - NOW, 7200)
+
+    def test_a_check_wait_between_two_waits_starts_their_budget_again(self):
+        # review of glaeda#2180 (BLOCK): one unreadable retry, then checks running past 2 h, then a review running: the
+        # review wait got no time at all ("waited 12607 s ... for a review verdict"). Only waits in a row share a budget.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}))
+        running = refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800})
+        self.w.answers += [running] * 5
+        review = refusal("review_running", LA, {"kind": "wait_comment", "match": "SHIP|BLOCK", "timeout_s": 600})
+        self.w.answers += [review] * 3
+        self.tick()
+        for _ in range(5):
+            self.tick(gg.LAND_RETRY_MAX + 1)
+        for _ in range(3):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)  # 3 waits: 5403 s, under the 2 h a review wait gets
+        self.assertEqual((e["state"], e["waitBudget"]["kind"], e["waitBudget"]["n"]), ("waiting", "wait_comment", 3),
+                         e.get("stop"))
+
+    def test_a_fetch_between_retries_keeps_their_budget(self):
+        # review of glaeda#2180 (second BLOCK): the mirror filled, still unreadable, the mirror stale again: fetch,
+        # retry, fetch, retry... A fetch relies on the streak, which each retry cleared; dropping the budget on it too
+        # left no bound at all (55 h, 111 judgments). A step that is bounded by the streak keeps the budget.
+        self.pr(LA)
+        self.land()
+        fetch = refusal("unreadable", LA, {"kind": "fetch", "argv": self.git_fetch()})
+        unread = refusal("unreadable", LA, {"kind": "retry", "after_s": 60})
+        self.w.answers += [fetch, unread] * 20
+        e = self.tick()
+        for _ in range(30):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"), e.get("waitBudget"))
+
+    def test_a_retry_never_strikes_and_stops_at_its_deadline_naming_it(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 8
+        e = self.tick()
+        for _ in range(3):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e.get("streak")), ("waiting", None))  # 4 judgments, 5403 s: no strike
+        e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
+        self.assertIn("for a judgment merge_hold could not make, still unreadable", e["stop"]["reason"])
+
+    def test_a_rerun_is_sent_at_most_three_times_per_run_at_a_head(self):
+        # each rerun's checks finish (cancelled again) within minutes, so the 2 h deadline alone allowed dozens
+        self.pr(LA)
+        self.land()
+        for i in range(6):
+            self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick()
+        for i in range(5):
+            if e["state"] == "stopped":
+                break
+            self.pr(LA, checks=[("shard", "COMPLETED", "CANCELLED"), (f"other{i}", "COMPLETED", "SUCCESS")])
+            e = self.tick(60)
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), gg.LAND_RERUN_CAP)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "rerun_failed_cap"))
+        self.assertIn(f"run 77 was rerun {gg.LAND_RERUN_CAP} times at {LA[:12]}", e["stop"]["reason"])
+        # landing it again starts the count again
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        self.land()
+        self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), gg.LAND_RERUN_CAP + 1)
+
+    def test_a_new_head_in_one_land_starts_the_rerun_count_again(self):
+        self.pr(LA)
+        self.land()
+        for i in range(gg.LAND_RERUN_CAP):
+            self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick()
+        for i in range(gg.LAND_RERUN_CAP - 1):
+            self.pr(LA, checks=[("shard", "COMPLETED", "CANCELLED"), (f"other{i}", "COMPLETED", "SUCCESS")])
+            e = self.tick(60)
+        self.assertEqual((e["state"], len(self.w.gh_calls("run", "rerun"))), ("waiting", gg.LAND_RERUN_CAP))
+        self.pr(LB)  # a push while the land stays open
+        self.w.answers.append(refusal("cancelled", LB, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick(60)
+        self.assertEqual((e["state"], len(self.w.gh_calls("run", "rerun"))), ("waiting", gg.LAND_RERUN_CAP + 1))
+        self.assertEqual(e["reruns"], {f"{LB}|77": 1})
+
+    def test_a_rerun_gh_refused_is_not_counted(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["rerun"] = 1
+        self.w.gh_err["rerun"] = "run 77 cannot be rerun: its workflow file is invalid"
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick()
+        self.assertEqual((len(self.w.gh_calls("run", "rerun")), e.get("reruns")), (1, {}))
+
+    def test_a_rerun_that_timed_out_still_counts(self):
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["rerun"] = 124  # a timeout may have reached GitHub
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        e = self.tick()
+        self.assertEqual(e.get("reruns"), {f"{LA}|77": 1})
+
+    def test_a_cancelled_judgment_never_leaves_a_rerun_count(self):
+        # review of glaeda#2180 F2: a newer land arriving mid-job; the stale job's count never lands on the new entry
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]}))
+        real_gh = self.q.gh
+
+        def newer_land_arrives() -> Any:  # take() reads the shim just before the count; the newer land is applied then
+            e = self.q.entries[self.KEY]
+            if (e.get("explain") or {}).get("action", {}).get("kind") == "rerun_failed" and not e.get("requeued"):
+                e.update(requeued=True, reruns=None, gen=int(e.get("gen") or 0) + 1)
+            return real_gh()
+
+        with mock.patch.object(self.q, "gh", side_effect=newer_land_arrives):
+            self.tick()
+        e = self.q.entries[self.KEY]
+        self.assertEqual((self.w.gh_calls("run", "rerun"), e.get("reruns")), ([], None))
+
+    def test_a_follower_whose_stopped_predecessor_was_pruned_stops_naming_it(self):
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land("o/r#2", requester="host/two")
+        self.land(after=["o/r#2"])
+        self.stop_o_r_2()
+        e = self.tick()
+        self.assertEqual((e["state"], e["afterStopped"]["key"]), ("waiting_after", "pr:o/r#2"))
+        del self.q.entries["pr:o/r#2"]  # its stopped entry aged out (LAND_KEEP) while #1 still waited on it
+        e = self.tick(600)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "after_stopped"))
+        self.assertIn("o/r#2, which it lands after, stopped and is no longer queued", e["stop"]["reason"])
+        self.assertEqual(e["stop"]["next"], "glaeda-gh land o/r#2 && glaeda-gh land o/r#1 --after o/r#2")
+
+    def test_a_cancelled_predecessor_stops_its_follower_at_once(self):
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land("o/r#2", requester="host/two")
+        self.land(after=["o/r#2"])
+        self.w.answers.append((1, {**refusal("checks_running", LC, {"kind": "wait_pr", "sha": LC})[1], "number": "2",
+                                   "action": {"v": 1, "kind": "wait_pr", "repo": "o/r", "number": 2, "head": LC,
+                                              "sha": LC, "timeout_s": 600}}))
+        self.tick()
+        gg.land_request(gg.LAND_WITHDRAW, "o/r#2", [], "host/two")
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "after_cancelled"))
+        self.assertEqual(e["stop"]["next"], "glaeda-gh land o/r#2 && glaeda-gh land o/r#1 --after o/r#2")
+
+    def test_a_predecessor_that_stops_again_tells_the_follower_again(self):
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land("o/r#2", requester="host/two")
+        self.land(after=["o/r#2"], requester="host/one")
+        self.stop_o_r_2("BLOCK one")
+        self.tick()
+        self.tick(600)
+        to_one = lambda: [m for m in self.w.sent() if m[3] == "host/one"]
+        self.assertEqual(len(to_one()), 1)
+        self.stop_o_r_2("BLOCK two")  # landed again, and stopped again: a new stop
+        self.land("o/r#2", requester="host/two")
+        self.tick()
+        self.tick()
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], len(to_one())), ("waiting_after", 2))
+        self.tick(600)
+        self.assertEqual(len(to_one()), 2)
+
     def test_a_change_alone_does_not_count_toward_the_stop(self):
         self.pr(LA)
         self.land()

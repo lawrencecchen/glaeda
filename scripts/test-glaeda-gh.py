@@ -24300,11 +24300,11 @@ case "MODE" in
          echo '{"type":"com.github.pull_request.state.changed.v1","data":{"api_url":"u"}}'
          echo 'event stream closed: unexpected EOF' >&2; exit 1 ;;
   rotate) echo 'Listening for events (subscription s1)' >&2; exit 8 ;;
-  live) echo 'Listening for events (subscription s1)' >&2; touch "$d/attached"
+  live) echo 'Listening for events (subscription s1)' >&2; : > "$d/attached"
         while :; do
           if [ -e "$d/emit" ]; then rm -f "$d/emit"
             echo '{"type":"com.github.pull_request.check_suite.status.changed.v1","data":{"conclusion":"success"}}'
-            touch "$d/emitted"; fi
+            : > "$d/emitted"; fi
           sleep 0.02
         done ;;
 esac
@@ -24328,9 +24328,11 @@ class EventStreamTest(Base):
         gg.EVENT_GH = os.fspath(self.gh_path)
         self.addCleanup(self.restore)
 
+    def tearDown(self) -> None:
+        self.daemon.events.stop_all()  # before Base removes the fake gh's folder under it
+        super().tearDown()
+
     def restore(self) -> None:
-        with contextlib.suppress(Exception):
-            self.daemon.events.stop_all()
         gg.EVENT_STREAMS, gg.EVENT_GH = self.saved_events
 
     def fake(self, mode: str, version: str = "2.105.0") -> None:
@@ -24341,6 +24343,19 @@ class EventStreamTest(Base):
     def listens(self) -> list[str]:
         log = self.bin / "argv.log"
         return [line for line in log.read_text().splitlines() if line.startswith("event listen")] if log.exists() else []
+
+    def wait_on(self, key: str, at: float) -> None:
+        """A wait's client touching its watch at fake time AT (its interest lasts WAIT_INTEREST from there)."""
+        gg.register(key, waited=True)
+        path = gg.watch_dir() / gg.file_name(key)
+        gg.write_json(path, {**gg.read_json(path), "waitedAt": at})  # (register never stamps the future)
+        os.utime(path, (at, at))
+
+    def listened(self, n: int) -> list[str]:
+        """The listeners started so far, which must be N (the daemon's own count), once the fake gh logged them."""
+        self.assertEqual(self.daemon.events.started, n)
+        self.until(lambda: len(self.listens()) >= n, f"{n} listeners to log")
+        return self.listens()
 
     def until(self, cond, what: str, limit: float = 5.0) -> None:
         end = time.monotonic() + limit
@@ -24361,40 +24376,45 @@ class EventStreamTest(Base):
         self.settled_pr()
         gg.register(self.KEY, waited=True)
         self.daemon.tick(NOW)
-        self.assertEqual(self.listens(), [])  # gh 2.100.0 has no `event`: never asked
+        self.daemon.tick(NOW + gg.TICK)  # the first tick read the PR: a listener only for a PR known open
+        self.listened(0)  # gh 2.100.0 has no `event`: never asked
         self.assertIn("2.100.0", self.daemon.events.view()["unavailable"])
         self.daemon.tick(NOW + gg.CYCLE)
         self.assertEqual(len(self.gh.gql_calls()), 2)  # plain polling, at the cycle
         self.fake("live")  # gh upgraded in place: the next tick sees it, no restart
         self.daemon.tick(NOW + gg.CYCLE + gg.TICK)
-        self.assertEqual(len(self.listens()), 1)
+        self.listened(1)
 
     def test_no_access_polls_and_asks_again_rarely(self) -> None:
         self.fake("denied")
         self.settled_pr()
         gg.register(self.KEY, waited=True)
         self.daemon.tick(NOW)
-        self.assertEqual(len(self.listens()), 1)
+        self.daemon.tick(NOW + gg.TICK)  # the first tick read the PR: a listener only for a PR known open
+        self.listened(1)
         self.until(self.ended, "the refused listener to exit")
-        self.daemon.tick(NOW + gg.TICK)
+        self.daemon.tick(NOW + 2 * gg.TICK)
         view = self.daemon.events.view()
         self.assertIn("not enabled for this account", view["unavailable"])
         self.assertEqual(view["live"], 0)
         for t in range(2, 40):
+            self.wait_on(self.KEY, NOW + t * gg.CYCLE / 2)  # the wait goes on (its client touches the watch)
             self.daemon.tick(NOW + t * gg.CYCLE / 2)
-        self.assertEqual(len(self.listens()), 1)  # the account is refused: not asked again every tick
+        self.listened(1)  # the account is refused: not asked again every tick
         self.assertGreaterEqual(len(self.gh.gql_calls()), 19)  # every cycle polled as before
-        self.daemon.tick(NOW + gg.EVENT_DENIED_RETRY + 1)
-        self.assertEqual(len(self.listens()), 2)  # access may have been granted since: one more try
+        self.wait_on(self.KEY, NOW + gg.EVENT_DENIED_RETRY + 3 * gg.TICK)
+        self.daemon.tick(NOW + gg.EVENT_DENIED_RETRY + 3 * gg.TICK)  # refused at NOW + 2 TICK
+        self.listened(2)  # access may have been granted since: one more try
 
     def test_an_event_reads_the_pr_at_once_and_polls_only_as_a_backstop(self) -> None:
         self.fake("live")
         self.settled_pr()
         gg.register(self.KEY, waited=True)
         self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)  # the first tick read the PR: a listener only for a PR known open
         self.assertEqual(len(self.gh.gql_calls()), 1)
-        self.assertEqual(len(self.listens()), 1)
-        argv = self.listens()[0]
+        self.listened(1)
+        argv = self.listened(1)[0]
         self.assertIn("--resource https://github.com/o/r/pull/1", argv)
         for event in gg.EVENT_TYPES:
             self.assertIn(event, argv)
@@ -24406,12 +24426,15 @@ class EventStreamTest(Base):
         self.assertEqual(self.daemon.events.view()["live"], 1)
         self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE)  # checks done, stream live: no poll at the cycle
         self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.assertEqual(self.daemon.events.view()["pollsSaved"], 1)
+        self.assertIn("1 live listeners", gg.events_line(self.daemon.events.view()))
         (self.bin / "emit").touch()
         self.until(lambda: (self.bin / "emitted").exists(), "the event")
         time.sleep(0.05)
         self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE + gg.TICK)  # the event: read within the tick
         self.assertEqual(len(self.gh.gql_calls()), 3)
         self.assertEqual(self.daemon.events.view()["events"], 1)
+        self.wait_on(self.KEY, NOW + gg.NUDGE_MIN + gg.CYCLE + gg.TICK + gg.EVENT_BACKSTOP)
         self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE + gg.TICK + gg.EVENT_BACKSTOP)  # the backstop still polls
         self.assertEqual(len(self.gh.gql_calls()), 4)
 
@@ -24422,6 +24445,7 @@ class EventStreamTest(Base):
         self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[check_run("ci", "IN_PROGRESS", None)])
         gg.register(self.KEY, waited=True)
         self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)  # the first tick read the PR: a listener only for a PR known open
         self.until(lambda: (self.bin / "attached").exists(), "the listener to attach")
         time.sleep(0.05)
         self.daemon.tick(NOW + gg.NUDGE_MIN)
@@ -24433,6 +24457,7 @@ class EventStreamTest(Base):
         self.settled_pr()
         gg.register(self.KEY, waited=True)
         self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)  # the first tick read the PR: a listener only for a PR known open
         self.until(self.ended, "the stream to close")
         self.daemon.tick(NOW + gg.NUDGE_MIN)  # its event, and its end (events while away are lost): read now
         self.assertEqual(len(self.gh.gql_calls()), 2)
@@ -24440,24 +24465,27 @@ class EventStreamTest(Base):
         self.assertIsNone(self.daemon.events.view()["unavailable"])  # one PR's stream, not the account
         self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE)  # no stream: the plain cycle
         self.assertEqual(len(self.gh.gql_calls()), 3)
-        self.assertEqual(len(self.listens()), 2)  # listened again after EVENT_RETRY
+        self.listened(2)  # listened again after EVENT_RETRY
         self.assertLessEqual(gg.EVENT_RETRY, gg.CYCLE)
 
     def test_a_planned_end_listens_again_at_once(self) -> None:
         self.fake("rotate")  # --timeout EVENT_LIFETIME reached: exit 8
+        self.settled_pr()
         gg.register(self.KEY, waited=True)
         self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)  # the first tick read the PR: a listener only for a PR known open
         self.until(self.ended, "the listener to end")
         self.daemon.tick(NOW + gg.TICK)
         self.daemon.tick(NOW + 2 * gg.TICK)
-        self.assertEqual(len(self.listens()), 2)
-        self.assertIn(f"--timeout {gg.EVENT_LIFETIME}s", self.listens()[0])
+        self.listened(2)
+        self.assertIn(f"--timeout {gg.EVENT_LIFETIME}s", self.listened(2)[0])
 
     def test_a_wait_that_ends_stops_its_listener(self) -> None:
         self.fake("live")
         self.settled_pr()
         gg.register(self.KEY, waited=True)
         self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)  # the first tick read the PR: a listener only for a PR known open
         proc = self.daemon.events.streams[self.KEY]["proc"]
         self.daemon.tick(NOW + gg.WAIT_INTEREST + gg.TICK)  # the wait timed out: nobody waits on the PR
         self.until(lambda: proc.poll() is not None, "the listener to stop")
@@ -24466,9 +24494,12 @@ class EventStreamTest(Base):
 
     def test_stop_all_leaves_no_listener(self) -> None:
         self.fake("live")
+        self.settled_pr()
+        self.gh.prs[("o", "r", 2)] = pr_node(2)
         gg.register(self.KEY, waited=True)
         gg.register("pr:o/r#2", waited=True)
         self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)
         procs = [s["proc"] for s in self.daemon.events.streams.values()]
         self.assertEqual(len(procs), 2)
         self.daemon.events.stop_all()  # before a re-exec and at exit
@@ -24480,7 +24511,8 @@ class EventStreamTest(Base):
         self.addCleanup(gg.DAEMON_CONFIG.unlink)
         gg.register(self.KEY, waited=True)
         self.daemon.tick(NOW)
-        self.assertEqual(self.listens(), [])
+        self.daemon.tick(NOW + gg.TICK)  # the first tick read the PR: a listener only for a PR known open
+        self.listened(0)
         self.assertIn("off", self.daemon.events.view()["unavailable"])
 
     def test_no_listener_for_an_unwaited_or_finished_pr(self) -> None:
@@ -24490,7 +24522,7 @@ class EventStreamTest(Base):
         gg.register("pr:o/r#3", waited=True)
         self.daemon.tick(NOW)
         self.daemon.tick(NOW + gg.TICK)
-        self.assertEqual(self.listens(), [])
+        self.listened(0)
 
 
 if __name__ == "__main__":

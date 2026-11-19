@@ -21968,7 +21968,9 @@ class LandTest(Base):
         self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [2, 2, 2])
         sent = self.w.sent()
         self.assertEqual(sorted(s[3] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
-        self.assertTrue(all("latch" in s[-1] and "leo-workspace#5944" in s[-1] for s in sent), sent)
+        # The notice quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
+        self.assertTrue(all("latch" in s[-1] and "no latch-free check on this host" in s[-1]
+                            and "leo-workspace#5944" not in s[-1] for s in sent), sent)
         self.tick(60)
         self.assertEqual(len(self.w.sent()), 3, "told once")
         # The next clear: at once, past no spread, oldest wake first
@@ -22779,7 +22781,10 @@ class LandTest(Base):
         def ready(argv, timeout, env):
             if argv[0] == "/fake/ready":
                 asked.append(list(argv))
-                return subprocess.CompletedProcess(argv, 0 if argv[-1] == "o" else 1, "", "")
+                if argv[-1] == "o":
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 1, "", f"gh-app-token: not ready for {argv[-1]}: "
+                                                                f"no App pool here serves {argv[-1]}\n")
             return run(argv, timeout, env)
         self.q.run = ready
         self.pr(LA)
@@ -22793,6 +22798,13 @@ class LandTest(Base):
         self.assertEqual(self.q.entries["pr:p/r#2"]["state"], "queued")  # p's have none: held, as before
         self.assertEqual(sorted({a[-1] for a in asked}), ["o", "p"])
         self.assertLessEqual(len(asked), 2, "asked once per owner per LAND_LATCH_FREE_EVERY")
+        # huge-blue, 2026-11-19: the starved-latch notice quotes ready's own reason (teamleaderleo: no App pool serves
+        # it), not a fixed "leo-workspace#5944"
+        self.assertEqual(self.q.latch_free_why(self.q.entries["pr:p/r#2"]), "no App pool here serves p")
+        self.assertEqual(gg.latch_free_reason(subprocess.CompletedProcess([], 124, "", "timed out after 10s")),
+                         "timed out after 10s")
+        self.assertEqual(gg.latch_free_reason(subprocess.CompletedProcess([], 2, "", "")),
+                         "the latch-free check exited 2")
 
     def test_the_pool_line_says_where_every_open_land_is(self):
         # huge-blue, 2026-11-18 16:11Z on: "busy 0, gated 0, snapshotWaiting 2, open 399" every 5 min, and nothing
@@ -22820,6 +22832,24 @@ class LandTest(Base):
         self.w.config["workers"] = 4
         self.assertEqual(self.q.workers(), 4)
         self.q.pool.shutdown(wait=True)
+
+    def test_login_workers_caps_only_lands_whose_reads_spend_the_login(self):
+        # huge-blue, 2026-11-19: workers raised past 4 for the App-pool lands; the login's REST reserve, which landing
+        # reads spend down to 0, must be spent no faster, so judgments read on the login keep their own cap.
+        self.assertEqual(self.q.login_workers(), self.q.workers())  # unset: no separate cap, as before
+        self.w.config.update(workers=16, loginWorkers=2)
+        self.assertEqual((self.q.workers(), self.q.login_workers()), (16, 2))
+        self.q.latch_free_seen.update({"o": (self.t, True, ""), "p": (self.t, False, "no App pool here serves p")})
+        for n, owner in enumerate(["p", "p", "o", "o", "o"]):
+            self.q.entries[f"pr:{owner}/r#{n}"] = {"key": f"pr:{owner}/r#{n}", "repo": f"{owner}/r"}
+            self.q.jobs[f"pr:{owner}/r#{n}"] = mock.Mock()
+        self.assertTrue(self.q.login_room({"repo": "o/r"}))  # App-pool reads: only workers caps it
+        self.assertFalse(self.q.login_room({"repo": "p/r"}))  # two login judgments run: at its cap
+        del self.q.jobs["pr:p/r#0"]
+        self.assertTrue(self.q.login_room({"repo": "p/r"}))
+        self.w.config["loginWorkers"] = 32
+        self.assertEqual(self.q.login_workers(), 16)  # never above workers
+        self.q.jobs.clear()
 
     def test_daemon_tick_runs_the_land_pass_only_once_land_exists(self):
         self.daemon.land_tick()

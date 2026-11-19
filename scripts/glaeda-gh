@@ -10237,6 +10237,17 @@ def land_quota_said(text: str, now: float) -> float | None:
     return None
 
 
+def latch_free_reason(got: subprocess.CompletedProcess) -> str:
+    """The latch-free check's own reason for "no" (gh_app_token.py ready prints "gh-app-token: not ready for OWNER:
+    WHY" on stderr): WHY, else its last line, else its exit. huge-blue, 2026-11-19: every starved-latch notice named
+    leo-workspace#5944 (merged) whatever kept the owner on the login; teamleaderleo's real reason was that no App pool
+    serves it."""
+    text = "\n".join(t for t in (got.stderr, got.stdout) if isinstance(t, str) and t.strip())
+    line = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")
+    m = re.search(r"not ready for \S+: (.+)", line)
+    return (m.group(1) if m else line)[:300] or f"the latch-free check exited {got.returncode}"
+
+
 def land_jitter(key: str, reset: float = 0.0) -> float:
     """This caller's offset past the reset RESET for KEY, 0..reset_spread_s (gh-quota.json; LAND_QUOTA_JITTER its
     default): fixed per host, PR and reset, so a re-park lands on the same second and the queues of every host spread
@@ -10470,7 +10481,8 @@ class LandQueue:
         self.pool_logged = float("-inf")
         self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
         self.pass_latched = 0  # open entries this pass skipped for it
-        self.latch_free_seen: dict[str, tuple[float, bool]] = {}  # owner -> (asked at, has an unlatched source)
+        # owner -> (asked at, has an unlatched source, why not: the check's own reason, quoted by hold's notice)
+        self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
         self.now = time.time()
@@ -10907,7 +10919,7 @@ class LandQueue:
                         f"glaeda land: {self.url(e)} has been due since {utc_clock(mark['dueSince'])} and not judged: "
                         f"the login's {'REST' if latch[0] == 'rest' else 'GraphQL'} latch has held through {n} "
                         f"windows (now until {utc_clock(until)}). It is judged first when the latch clears; nothing "
-                        "to do. The unblock is the App read pools (leo-workspace#5944)")
+                        f"to do. Its reads have no source here but the login: {self.latch_free_why(e)}")
         self.save(e)
 
     def unhold(self, e: dict) -> None:
@@ -11119,14 +11131,22 @@ class LandQueue:
         if seen is not None and self.now - seen[0] < LAND_LATCH_FREE_EVERY:
             return seen[1]
         argv = self.latch_free_argv(owner)
-        free = False
+        free, why = False, "no latch-free check on this host (land.json latchFreeCommand, or gh_app_token.py " \
+            "beside merge_hold.py)"
         if argv is not None:
             got = self.call(argv, LAND_LATCH_FREE_DEADLINE)
             free = got.returncode == 0
+            why = "" if free else latch_free_reason(got)
         if seen is None or seen[1] != free:
-            log({"event": "land-latch-free" if free else "land-latch-holds", "owner": owner})
-        self.latch_free_seen[owner] = (self.now, free)
+            log({"event": "land-latch-free" if free else "land-latch-holds", "owner": owner,
+                 **({} if free else {"why": why})})
+        self.latch_free_seen[owner] = (self.now, free, why)
         return free
+
+    def latch_free_why(self, e: dict) -> str:
+        """Why E's owner has no source the latch does not hold, as the latch-free check last said (latch_free)."""
+        seen = self.latch_free_seen.get(str(e.get("repo") or "").split("/")[0].lower())
+        return (seen[2] if seen and not seen[1] else "") or "the latch-free check gave no reason"
 
     def latch_free_argv(self, owner: str) -> list[str] | None:
         given = self.config().get("latchFreeCommand")
@@ -11141,6 +11161,28 @@ class LandQueue:
     def workers(self) -> int:
         """land.json "workers", else LAND_WORKERS; nothing else sizes it (no load-based sizing)."""
         return int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, LAND_WORKERS_MAX))
+
+    def login_workers(self) -> int:
+        """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
+        no for their owner), else workers(). So "workers" can grow for lands read through the App pools (each its own
+        installation quota) while the login's REST reserve, which landing reads spend down to 0, is spent no faster.
+        huge-blue, 2026-11-19 14:00Z: 4 of 4 busy, 187 due, 123 dueLate, 32 cores at load ~10-14."""
+        given = self.config().get("loginWorkers")
+        if given is None:
+            return self.workers()
+        return min(self.workers(), int(land_seconds(given, LAND_WORKERS, 1, LAND_WORKERS_MAX)))
+
+    def login_room(self, e: dict) -> bool:
+        """Whether E may start now under login_workers: an owner with an unlatched source always may."""
+        cap = self.login_workers()
+        if cap >= self.workers() or self.latch_free(e):
+            return True
+        on_login = 0
+        for k in self.jobs:
+            owner = str((self.entries.get(k) or {}).get("repo") or "").split("/")[0].lower()
+            seen = self.latch_free_seen.get(owner)
+            on_login += 0 if seen and seen[1] else 1
+        return on_login < cap
 
     def gated(self, e: dict) -> None:
         """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line."""
@@ -11184,7 +11226,7 @@ class LandQueue:
                     late += 1 if since and self.now - since >= LAND_DUE_LATE else 0
         oldest = min(due) if due else None
         latch = self.pass_latch
-        log({"event": "land-pool", "workers": self.workers(),
+        log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else "default", "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
@@ -11596,6 +11638,9 @@ class LandQueue:
             return False  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
         if not free:
             self.gated(e)  # a judgment it could start: ready, waiting for a worker
+            return False
+        if not self.login_room(e):
+            self.gated(e)  # its reads spend the login: the login's share of the workers is busy
             return False
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()

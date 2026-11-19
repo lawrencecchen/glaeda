@@ -3825,6 +3825,7 @@ def read_rollup(key: str) -> dict | None:
 EVENT_STREAMS = os.environ.get("GLAEDA_GH_EVENTS") != "0"
 EVENT_GH: str | None = None  # the gh to run (tests); None: broker_real_gh(), never the shim chain
 EVENT_GH_MIN = (2, 105, 0)
+EVENT_GH_PATHS = (os.fspath(Path.home() / ".local/bin/gh"), "/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh")
 EVENT_TYPES = ("com.github.pull_request.review.submitted.v1", "com.github.pull_request.state.changed.v1",
                "com.github.pull_request.head.changed.v1", "com.github.pull_request.merge_conflict.v1",
                "com.github.pull_request.check_suite.status.changed.v1")
@@ -3872,10 +3873,10 @@ class EventStreams:
         self.backoff: dict[str, float] = {}
         self.unavailable: str | None = None
         self.unavailable_until = float("-inf")
-        self.gh_path: str | None = None
+        self.gh_path: str | None = None  # the gh the listeners run (EventStreams.gh)
+        self.gh_list: list[str] | None = None
         self.gh_found_at = float("-inf")
-        self.gh_seen: tuple[str, float] | None = None  # (path, mtime) whose version was read
-        self.gh_ok = False
+        self.versions: dict[tuple[str, float], tuple[int, ...] | None] = {}  # (path, mtime) -> its version
         self.events = 0
         self.saved = 0  # PR polls a live stream stood in for (Daemon.due's backstop)
         self.started = 0
@@ -3897,36 +3898,54 @@ class EventStreams:
             log({"event": "events-unavailable", "why": why})
         self.unavailable, self.unavailable_until = why, until
 
-    def gh(self, now: float) -> str | None:
-        """The real gh when it is new enough, else None with the reason in self.unavailable."""
-        if self.gh_path is None or now - self.gh_found_at >= EVENT_GH_RECHECK:
-            try:
-                self.gh_path = EVENT_GH or broker_real_gh()
-            except WatchError as error:
-                self.gh_path = None
-                self.refuse(f"no gh: {error}", now + EVENT_GH_RECHECK)
-                return None
-            self.gh_found_at = now
+    def candidates(self, now: float) -> list[str]:
+        """The gh binaries to try, best first: the one the broker uses, then the usual install paths (a host whose
+        first gh is an older Homebrew one may hold a newer one in ~/.local/bin). Looked up again every EVENT_GH_RECHECK."""
+        if EVENT_GH:
+            return [EVENT_GH]
+        if self.gh_list is None or now - self.gh_found_at >= EVENT_GH_RECHECK:
+            found: list[str] = []
+            with contextlib.suppress(WatchError):
+                found.append(broker_real_gh())
+            found += list(EVENT_GH_PATHS)
+            self.gh_list, self.gh_found_at = list(dict.fromkeys(found)), now
+        return self.gh_list
+
+    def version(self, path: str) -> tuple[int, ...] | None | bool:
+        """PATH's gh version, read once per binary (path and mtime: an upgrade in place is read again); False when
+        there is no such file."""
         try:
-            seen = (self.gh_path, os.stat(self.gh_path).st_mtime)
-        except OSError as error:
-            self.gh_path = None
-            self.refuse(f"gh: {describe(error)}", now + EVENT_GH_RECHECK)
-            return None
-        if seen != self.gh_seen:  # a new binary (an upgrade in place): read its version once
-            self.gh_seen = seen
+            seen = (path, os.stat(path).st_mtime)
+        except OSError:
+            return False
+        if seen not in self.versions:
             try:
-                out = run_bounded([self.gh_path, "--version"]).stdout
-            except (OSError, subprocess.TimeoutExpired) as error:
-                out = f"{type(error).__name__}"
-            version = gh_version_of(out)
-            self.gh_ok = version is not None and version >= EVENT_GH_MIN
-            if not self.gh_ok:
-                shown = ".".join(map(str, version)) if version else (out.strip().splitlines() or ["?"])[0][:80]
-                self.refuse(f"gh {shown} < {'.'.join(map(str, EVENT_GH_MIN))} ({self.gh_path})", now + EVENT_GH_RECHECK)
-            elif self.unavailable and self.unavailable.startswith("gh "):
-                self.unavailable, self.unavailable_until = None, float("-inf")  # upgraded: try at once
-        return self.gh_path if self.gh_ok else None
+                out = run_bounded([path, "--version"]).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                out = ""
+            self.versions[seen] = gh_version_of(out)
+        return self.versions[seen]
+
+    def gh(self, now: float) -> str | None:
+        """The first candidate gh that is new enough, else None with the reason in self.unavailable."""
+        older = None
+        for path in self.candidates(now):
+            version = self.version(path)
+            if version and version >= EVENT_GH_MIN:
+                self.gh_path = path
+                if self.unavailable and (self.unavailable.startswith("gh ") or self.unavailable.startswith("no gh")):
+                    self.unavailable, self.unavailable_until = None, float("-inf")  # upgraded: try at once
+                return path
+            if version is not False and older is None:
+                older = (path, version)
+        self.gh_path = None
+        want = ".".join(map(str, EVENT_GH_MIN))
+        if older is None:
+            self.refuse("no gh found", now + EVENT_GH_RECHECK)
+        else:
+            shown = ".".join(map(str, older[1])) if older[1] else "of unknown version"
+            self.refuse(f"gh {shown} < {want} ({older[0]})", now + EVENT_GH_RECHECK)
+        return None
 
     def start(self, key: str, gh: str, now: float) -> None:
         argv = [gh, "event", "listen", "--resource", pr_url_of(key), "--event", ",".join(EVENT_TYPES),
@@ -4003,7 +4022,7 @@ class EventStreams:
             self.refuse(f"GitHub refused: {last}", now + EVENT_DENIED_RETRY)
             self.stop_all()  # the account is refused: every other listener is too
         elif EVENT_UNSUPPORTED.search(text):
-            self.gh_seen, self.gh_ok = None, False  # read the version again
+            self.versions.clear()  # read the versions again
             self.refuse(f"gh has no event listen: {last}", now + EVENT_GH_RECHECK)
         elif code == EVENT_TIMEOUT_EXIT:
             self.retry_at[key] = now  # EVENT_LIFETIME reached: listen again at once

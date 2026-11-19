@@ -24385,6 +24385,24 @@ class EventStreamTest(Base):
         self.daemon.tick(NOW + gg.CYCLE + gg.TICK)
         self.listened(1)
 
+    def test_a_newer_gh_past_an_older_first_one_is_used(self) -> None:
+        # this Mac, 2026-11-19: the first gh found (a wrapper over Homebrew's) was 2.100.0, a checked 2.105.0 sat in
+        # ~/.local/bin; the listener takes the first gh that is new enough
+        self.fake("live")
+        old = self.bin / "old-gh"
+        old.write_text("#!/bin/sh\necho 'gh version 2.100.0 (2026-09-03)'\n")
+        old.chmod(0o755)
+        gg.EVENT_GH = None
+        with mock.patch.object(gg, "broker_real_gh", return_value=os.fspath(old)), \
+                mock.patch.object(gg, "EVENT_GH_PATHS", (os.fspath(self.bin / "absent"), os.fspath(self.gh_path))):
+            self.settled_pr()
+            gg.register(self.KEY, waited=True)
+            self.daemon.tick(NOW)
+            self.daemon.tick(NOW + gg.TICK)
+            self.listened(1)
+            self.assertEqual(self.daemon.events.view()["gh"], os.fspath(self.gh_path))
+            self.assertIsNone(self.daemon.events.view()["unavailable"])
+
     def test_no_access_polls_and_asks_again_rarely(self) -> None:
         self.fake("denied")
         self.settled_pr()

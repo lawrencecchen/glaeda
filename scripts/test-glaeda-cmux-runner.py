@@ -15917,7 +15917,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(json.loads(receipt_path.read_text())["registration"]["runnerId"], 4242)
         self.assertFalse(any(e["tool"] == "launchctl" for e in self.log()), "sandbox HOME never calls launchctl")
 
-        before = self.tree()
+        before = RunnerTest.tree(self)
         calls = len(self.log())
         second = self.invoke("--apply", "--labels", "cmux-extra")
         states = {a["state"] for a in second["actions"] if a["kind"] != "verify"}
@@ -16219,7 +16219,7 @@ class RunnerTest(unittest.TestCase):
         runner = self.home / "actions-runner-glaeda"
         runner.mkdir()
         (runner / "config.sh").write_text("#!/bin/sh\n")
-        before = self.tree()
+        before = RunnerTest.tree(self)
         receipt = self.invoke("--uninstall", "--apply")
         self.assertTrue(any("nothing is removed" in a.get("note", "") for a in receipt["actions"]))
         after = {k: v for k, v in self.tree().items() if not k.startswith(".local")}
@@ -17590,7 +17590,7 @@ print(json.dumps({{"actions": [{{"kind": "register", "labels": {labels!r}}}]}}))
 
     def test_relabel_without_a_token_blocks_and_changes_nothing(self) -> None:
         self.invoke("--apply", "--labels", "ram48")
-        before = self.tree()
+        before = RunnerTest.tree(self)
         real_which = cr.which
         with mock.patch.object(cr, "which", lambda name, extra=(): None if name == "gh" else real_which(name, extra)), \
                 mock.patch.object(cr, "xcode_present", return_value=False):
@@ -17665,7 +17665,7 @@ print(json.dumps({{"actions": [{{"kind": "register", "labels": {labels!r}}}]}}))
             self.assertTrue(again["ready"], again["blocking"])
             self.assertEqual({a["state"] for a in again["actions"] if a["kind"] != "verify"}, {"unchanged"})
 
-            before = self.tree()
+            before = RunnerTest.tree(self)
             stuck = self.invoke("--uninstall", "--apply", gh=False, expect=1)  # no way to deregister: touch nothing
             self.assertFalse(stuck["ready"])
             self.assertTrue(all(a["state"] == "blocked" for a in stuck["actions"]), stuck["actions"])
@@ -17848,6 +17848,11 @@ NIGHTLY = {"name": "nightly-next", "repo": "manaflow-ai/cmux",
            "env": {"NIGHTLY_BUILDER_RUNNER_DIR": "{runnerDir}", "PATH": "~/.local/bin"}}
 
 
+HQ_USER = {"name": "hq-two-mac-a", "repo": "manaflow-ai/other", "trustedRef": "refs/heads/main",
+           "trustedRepo": "manaflow-ai/other", "labels": ["glaeda-hq-two-mac-a"], "admit": ["/usr/bin/true"],
+           "user": "cmuxci-gui-01"}
+
+
 def dedicated_manifest(*entries: dict) -> dict:
     manifest = copy.deepcopy(MANIFEST)
     manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"dedicated": [copy.deepcopy(e) for e in entries]}}
@@ -17893,6 +17898,183 @@ class DedicatedRunnerTest(unittest.TestCase):
         headless["hosts"]["mini-std"]["gui"] = False
         _, why = fleet_labels.dedicated_runners(headless, "mini-std")
         self.assertIn("gui: false", why or "")
+
+    def test_a_user_entry_is_validated(self) -> None:
+        """DEDICATED_USER (cmuxterm-hq#13863): "user" names the macOS account a trusted entry runs as. Never root, never the
+        member's own ssh_user, only with trustedRef, never with lanRelay or yieldToExclusive."""
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(HQ_USER), "mini-std")
+        self.assertIsNone(why)
+        self.assertEqual(good[0]["user"], "cmuxci-gui-01")
+        good, _ = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertIsNone(good[0]["user"])
+        untrusted = {k: v for k, v in HQ_USER.items() if k not in ("trustedRef", "trustedRepo")}
+        for entry, needle in (({**HQ_USER, "user": "root"}, "never root"), ({**HQ_USER, "user": "Bad User"}, "short name"),
+                              ({**HQ_USER, "user": 5}, "short name"), (untrusted, "needs trustedRef"),
+                              ({**HQ_USER, "yieldToExclusive": True}, "without lanRelay and yieldToExclusive"),
+                              ({**HQ_USER, "user": "cmux"}, "own ssh_user")):
+            with self.subTest(entry=entry):
+                manifest = dedicated_manifest(entry)
+                manifest["ssh_user"] = "cmux"
+                _, why = fleet_labels.dedicated_runners(manifest, "mini-std")
+                self.assertIn(needle, why or "")
+        relay = dedicated_manifest({**HQ_USER, "lanRelay": "10.0.0.2:22"})
+        relay["hosts"]["mini-std"]["overrides"]["runner"]["dedicatedOnly"] = True
+        _, why = fleet_labels.dedicated_runners(relay, "mini-std")
+        self.assertIn("without lanRelay", why or "")
+
+    def test_a_user_entry_installs_only_as_its_user_private_and_off_the_shared_ledger(self) -> None:
+        """DEDICATED_USER: run as anyone but its user, --dedicated refuses and changes nothing (so the member user's
+        apply never installs it). As its user: the home and the runner directory end 0700, its hook keeps its ledger
+        under its own state, it takes no capacity unit and writes no dedicatedOnly marker."""
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        manifest = dedicated_manifest(HQ_USER)
+        manifest["ssh_user"] = "cmux"
+        manifest["hosts"]["mini-std"]["overrides"]["runner"]["dedicatedOnly"] = True
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest))
+        before = RunnerTest.tree(self)
+        for me in ("cmux", None):
+            with self.subTest(me=me), mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                    mock.patch.object(cr, "current_user", return_value=me), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                code = cr.main(["--output", "json", "--apply", "--manifest", os.fspath(path), "--member", "mini-std",
+                                "--dedicated", "hq-two-mac-a"])
+            self.assertEqual(code, 2)
+            self.assertIn("runs as macOS user cmuxci-gui-01", err.getvalue())
+            self.assertEqual(RunnerTest.tree(self), before, "nothing changed")
+        self.home.chmod(0o755)
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None):
+            receipt = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
+                                  "--dedicated", "hq-two-mac-a")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
+        self.assertEqual(self.by_kind(receipt)["private"]["state"], "create")
+        self.assertTrue(self.by_kind(receipt)["private"]["applied"])
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(runner.stat().st_mode & 0o777, 0o700)
+        ledger = self.home / ".local/state/glaeda/cmux-runner" / cr.USER_CAPACITY_DIR
+        hooks = runner / cr.HOOK_DIR
+        for name in ("job-started.sh", "job-completed.sh", "listen.sh"):
+            self.assertIn(f"--capacity-dir {ledger}", (hooks / name).read_text(), name)
+        started = (hooks / "job-started.sh").read_text()
+        self.assertNotIn("--capacity-units", started)
+        self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/other", started)
+        self.assertFalse((self.home / ".local/state/glaeda/cmux-runner" / cr.DEDICATED_ONLY_MARKER).exists())
+        # a re-run finds it private and changes nothing there
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None):
+            again = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
+                                "--dedicated", "hq-two-mac-a")
+        self.assertEqual(self.by_kind(again)["private"]["state"], "unchanged")
+
+    def test_the_toolchain_check_takes_only_root_or_self_owned_unwritable_paths(self) -> None:
+        """PROTECTED_TOOLCHAIN (review of 7c91dc6b): a user entry execs nothing another account can replace. Each path,
+        its target and every directory above must be owned by root or this account, with no group or other write."""
+        me = 5101
+        d, f, link = stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK
+
+        def table(**extra):
+            entries = {"/": (0, d | 0o755), "/usr": (0, d | 0o755), "/usr/bin": (0, d | 0o755),
+                       "/usr/bin/python3": (0, f | 0o755), "/opt": (0, d | 0o755),
+                       "/opt/homebrew": (501, d | 0o775), "/opt/homebrew/bin": (501, d | 0o775),
+                       "/opt/homebrew/bin/python3": (501, link | 0o755), "/Users": (0, d | 0o755),
+                       "/Users/gui": (me, d | 0o700), "/Users/gui/bin": (me, d | 0o755),
+                       "/Users/gui/bin/tool": (me, f | 0o755), "/Users/gui/open": (me, d | 0o777),
+                       "/Users/gui/cmux-made": (501, f | 0o755), **extra}
+
+            def lstat(path):
+                if path not in entries:
+                    raise FileNotFoundError(path)
+                uid, mode = entries[path]
+                return mock.Mock(st_uid=uid, st_mode=mode)
+            return lstat
+        lstat = table()
+        with mock.patch.object(cr.os.path, "realpath", side_effect=lambda x: x):
+            self.assertIsNone(cr.untrusted_exec("/usr/bin/python3", me, lstat))
+            self.assertIsNone(cr.untrusted_exec("/Users/gui/bin/tool", me, lstat))
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/opt/homebrew/bin/python3", me, lstat))
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/Users/gui/cmux-made", me, lstat))
+            self.assertIn("writable by group or other", cr.untrusted_exec("/Users/gui/open", me, lstat))
+            self.assertIn("cannot be read", cr.untrusted_exec("/usr/bin/missing", me, lstat))
+            self.assertEqual(cr.untrusted_exec("relative/tool", me, lstat), "not an absolute path")
+            # an owner-written dir that is group-writable still fails (macOS /Applications is root:admin 0775)
+            self.assertIn("writable by group or other",
+                          cr.untrusted_exec("/usr/bin/python3", me, table(**{"/usr/bin": (0, d | 0o775)})))
+        # a symlink whose target fails is refused through its target
+        with mock.patch.object(cr.os.path, "realpath",
+                               side_effect=lambda x: "/opt/homebrew/bin/python3" if x == "/usr/bin/python3" else x):
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/usr/bin/python3", me, lstat))
+
+    def test_a_user_entry_runs_a_protected_toolchain_and_refuses_an_unprotected_one(self) -> None:
+        """PROTECTED_TOOLCHAIN: with no --python a user entry's hooks run Apple's /usr/bin/python3; its agent, watch,
+        listener gate and .path hold only the system PATH and DEVELOPER_DIR is the Command Line Tools. A declared PATH
+        entry, an admit command or an interpreter that fails the check blocks the whole install, typed."""
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        entry = {**HQ_USER, "watch": ["/usr/bin/true"], "env": {"PATH": "~/.local/bin"}}
+        manifest = dedicated_manifest(entry)
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest))
+        argv = ["--output", "json", "--gh", os.fspath(self.gh), "--apply", "--manifest", os.fspath(path),
+                "--member", "mini-std", "--dedicated", "hq-two-mac-a"]
+        out = io.StringIO()
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None), contextlib.redirect_stdout(out):
+            self.assertEqual(cr.main(argv), 0, out.getvalue()[-2000:])
+        receipt = json.loads(out.getvalue())
+        self.assertEqual(receipt["actions"][0]["kind"], "toolchain")
+        self.assertEqual(receipt["actions"][0]["state"], "unchanged")
+        runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
+        hooks = runner / cr.HOOK_DIR
+        self.assertTrue((hooks / "job-started.sh").read_text().splitlines()[-1].startswith("exec /usr/bin/python3 "))
+        listen = (hooks / "listen.sh").read_text()
+        self.assertIn(f"export DEVELOPER_DIR={cr.PROTECTED_DEVELOPER_DIR}\nexport PATH={cr.PROTECTED_PATH}\n", listen)
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.hq-two-mac-a"
+        agent = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.plist").read_bytes())
+        self.assertEqual(agent["EnvironmentVariables"]["PATH"], cr.PROTECTED_PATH)
+        self.assertEqual(agent["EnvironmentVariables"]["DEVELOPER_DIR"], cr.PROTECTED_DEVELOPER_DIR)
+        watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
+        self.assertEqual(watch["EnvironmentVariables"]["PATH"], f"{self.home}/.local/bin:{cr.PROTECTED_PATH}")
+        dot_path = (runner / ".path").read_text().strip().split(":")
+        self.assertEqual(dot_path, [f"{self.home}/.local/bin", *cr.PROTECTED_PATH.split(":")])
+        for dirs in (dot_path, watch["EnvironmentVariables"]["PATH"].split(":"), agent["EnvironmentVariables"]["PATH"].split(":")):
+            self.assertFalse([e for e in dirs if e.startswith(("/opt/homebrew", "/usr/local"))])
+        # the checked set: the interpreters, the Command Line Tools' python3, each PATH dir, the admit and watch commands
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"):
+            checked = []
+
+            def record(p, uid, lstat=None):
+                checked.append(p)
+                return "owned by uid 501, not root or this account" if p == f"{self.home}/.local/bin" else None
+            with mock.patch.object(cr, "untrusted_exec", side_effect=record), \
+                    contextlib.redirect_stdout(io.StringIO()) as out2:
+                code = cr.main([*argv[:-1], "hq-two-mac-a"])
+        self.assertEqual(code, 1)
+        doc = json.loads(out2.getvalue())
+        tool = doc["actions"][0]
+        self.assertEqual((tool["kind"], tool["state"], tool["missing"]), ("toolchain", "blocked", "protected-toolchain"))
+        self.assertIn(".local/bin", tool["note"])
+        for want in ("/usr/bin/python3", f"{cr.PROTECTED_DEVELOPER_DIR}/usr/bin/python3", "/usr/bin", "/sbin",
+                     "/usr/bin/true", sys.executable):
+            self.assertIn(want, checked)
+        self.assertFalse([a for a in doc["actions"][1:] if a.get("applied")], "nothing applied past a blocked toolchain")
+
+    def test_an_entry_without_a_user_refuses_another_account(self) -> None:
+        """An entry with no user is the member user's: run as another account (a hidden GUI user) it refuses."""
+        manifest = dedicated_manifest(NIGHTLY)
+        manifest["ssh_user"] = "cmux"
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cr.main(["--output", "json", "--manifest", os.fspath(path), "--member", "mini-std",
+                            "--dedicated", "nightly-next"])
+        self.assertEqual(code, 2)
+        self.assertIn("declares no user, so it is cmux's runner", err.getvalue())
 
     def test_an_entry_that_yields_to_exclusive_passes_the_opt_in_to_its_hook(self) -> None:
         good, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")

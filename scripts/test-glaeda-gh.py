@@ -97,6 +97,10 @@ def no_head_runs(repo: str, paths: list[str], budget: float = 0) -> dict:
 
 
 gg.head_runs_get = no_head_runs
+# Nor may a daemon in a test (or a `serve` a test starts) open a real `gh event listen` on GitHub: only EventStreamTest
+# turns the streams on, with a fake gh.
+gg.EVENT_STREAMS = False
+os.environ["GLAEDA_GH_EVENTS"] = "0"
 gg.NOTICES_DIR = Path(_NOTICES.name)
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
@@ -24283,6 +24287,210 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertIsNone(pool.owner_of("POST", "/graphql", mutation))
         query = {"query": "query($o0: String!) { x }", "variables": {"o0": "manaflow-ai"}}
         self.assertEqual(pool.owner_of("POST", "/graphql", query), "manaflow-ai")
+
+
+FAKE_EVENT_GH = """#!/bin/bash
+d=$(dirname "$0")
+if [ "$1" = "--version" ]; then echo "gh version VERSION (2026-11-17)"; exit 0; fi
+echo "$*" >> "$d/argv.log"
+case "MODE" in
+  old) echo 'unknown command "event" for "gh"' >&2; exit 1 ;;
+  denied) echo 'event subscriptions are in preview and not enabled for this account: HTTP 403: Event subscriptions are not enabled for this account (https://api.github.com/event-subscriptions)' >&2; exit 1 ;;
+  close) echo 'Listening for events (subscription s1)' >&2
+         echo '{"type":"com.github.pull_request.state.changed.v1","data":{"api_url":"u"}}'
+         echo 'event stream closed: unexpected EOF' >&2; exit 1 ;;
+  rotate) echo 'Listening for events (subscription s1)' >&2; exit 8 ;;
+  live) echo 'Listening for events (subscription s1)' >&2; touch "$d/attached"
+        while :; do
+          if [ -e "$d/emit" ]; then rm -f "$d/emit"
+            echo '{"type":"com.github.pull_request.check_suite.status.changed.v1","data":{"conclusion":"success"}}'
+            touch "$d/emitted"; fi
+          sleep 0.02
+        done ;;
+esac
+"""
+
+
+class EventStreamTest(Base):
+    """gh event listen (gh >= 2.105.0, Event Streams preview): the daemon holds one listener per waited PR for every
+    session, a PR event re-reads the PR at once, and polling stays the fallback: an old gh, an account without
+    access, a stream that closes mid-wait and a wait that ends (its timeout) each leave plain polling, never less."""
+
+    KEY = "pr:o/r#1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.saved_events = (gg.EVENT_STREAMS, gg.EVENT_GH)
+        self.bin = Path(self.tmp.name) / "bin"
+        self.bin.mkdir()
+        self.gh_path = self.bin / "gh"
+        gg.EVENT_STREAMS = True
+        gg.EVENT_GH = os.fspath(self.gh_path)
+        self.addCleanup(self.restore)
+
+    def restore(self) -> None:
+        with contextlib.suppress(Exception):
+            self.daemon.events.stop_all()
+        gg.EVENT_STREAMS, gg.EVENT_GH = self.saved_events
+
+    def fake(self, mode: str, version: str = "2.105.0") -> None:
+        self.gh_path.write_text(FAKE_EVENT_GH.replace("VERSION", version).replace("MODE", mode))
+        self.gh_path.chmod(0o755)
+        os.utime(self.gh_path, None)
+
+    def listens(self) -> list[str]:
+        log = self.bin / "argv.log"
+        return [line for line in log.read_text().splitlines() if line.startswith("event listen")] if log.exists() else []
+
+    def until(self, cond, what: str, limit: float = 5.0) -> None:
+        end = time.monotonic() + limit
+        while not cond():
+            if time.monotonic() > end:
+                self.fail(f"timed out waiting for {what}")
+            time.sleep(0.02)
+
+    def ended(self) -> bool:
+        s = self.daemon.events.streams.get(self.KEY)
+        return s is None or s["proc"].poll() is not None
+
+    def settled_pr(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1, rollup="SUCCESS", checks=[check_run("ci")])
+
+    def test_old_gh_polls_and_takes_the_upgrade(self) -> None:
+        self.fake("old", "2.100.0")
+        self.settled_pr()
+        gg.register(self.KEY, waited=True)
+        self.daemon.tick(NOW)
+        self.assertEqual(self.listens(), [])  # gh 2.100.0 has no `event`: never asked
+        self.assertIn("2.100.0", self.daemon.events.view()["unavailable"])
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(len(self.gh.gql_calls()), 2)  # plain polling, at the cycle
+        self.fake("live")  # gh upgraded in place: the next tick sees it, no restart
+        self.daemon.tick(NOW + gg.CYCLE + gg.TICK)
+        self.assertEqual(len(self.listens()), 1)
+
+    def test_no_access_polls_and_asks_again_rarely(self) -> None:
+        self.fake("denied")
+        self.settled_pr()
+        gg.register(self.KEY, waited=True)
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.listens()), 1)
+        self.until(self.ended, "the refused listener to exit")
+        self.daemon.tick(NOW + gg.TICK)
+        view = self.daemon.events.view()
+        self.assertIn("not enabled for this account", view["unavailable"])
+        self.assertEqual(view["live"], 0)
+        for t in range(2, 40):
+            self.daemon.tick(NOW + t * gg.CYCLE / 2)
+        self.assertEqual(len(self.listens()), 1)  # the account is refused: not asked again every tick
+        self.assertGreaterEqual(len(self.gh.gql_calls()), 19)  # every cycle polled as before
+        self.daemon.tick(NOW + gg.EVENT_DENIED_RETRY + 1)
+        self.assertEqual(len(self.listens()), 2)  # access may have been granted since: one more try
+
+    def test_an_event_reads_the_pr_at_once_and_polls_only_as_a_backstop(self) -> None:
+        self.fake("live")
+        self.settled_pr()
+        gg.register(self.KEY, waited=True)
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.assertEqual(len(self.listens()), 1)
+        argv = self.listens()[0]
+        self.assertIn("--resource https://github.com/o/r/pull/1", argv)
+        for event in gg.EVENT_TYPES:
+            self.assertIn(event, argv)
+        self.assertIn("--follow", argv)
+        self.until(lambda: (self.bin / "attached").exists(), "the listener to attach")
+        time.sleep(0.05)
+        self.daemon.tick(NOW + gg.NUDGE_MIN)  # attached: one read now (events before the attach are not replayed)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.assertEqual(self.daemon.events.view()["live"], 1)
+        self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE)  # checks done, stream live: no poll at the cycle
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        (self.bin / "emit").touch()
+        self.until(lambda: (self.bin / "emitted").exists(), "the event")
+        time.sleep(0.05)
+        self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE + gg.TICK)  # the event: read within the tick
+        self.assertEqual(len(self.gh.gql_calls()), 3)
+        self.assertEqual(self.daemon.events.view()["events"], 1)
+        self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE + gg.TICK + gg.EVENT_BACKSTOP)  # the backstop still polls
+        self.assertEqual(len(self.gh.gql_calls()), 4)
+
+    def test_running_checks_keep_the_cycle_with_a_live_stream(self) -> None:
+        # a check suite sends its event only when it completes, and commit statuses send none: while any check runs
+        # the cycle stays, so a first failed check is seen as soon as before
+        self.fake("live")
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[check_run("ci", "IN_PROGRESS", None)])
+        gg.register(self.KEY, waited=True)
+        self.daemon.tick(NOW)
+        self.until(lambda: (self.bin / "attached").exists(), "the listener to attach")
+        time.sleep(0.05)
+        self.daemon.tick(NOW + gg.NUDGE_MIN)
+        self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE)
+        self.assertEqual(len(self.gh.gql_calls()), 3)
+
+    def test_a_stream_closed_mid_wait_reads_now_and_polls_until_it_is_back(self) -> None:
+        self.fake("close")
+        self.settled_pr()
+        gg.register(self.KEY, waited=True)
+        self.daemon.tick(NOW)
+        self.until(self.ended, "the stream to close")
+        self.daemon.tick(NOW + gg.NUDGE_MIN)  # its event, and its end (events while away are lost): read now
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.assertEqual(self.daemon.events.view()["live"], 0)
+        self.assertIsNone(self.daemon.events.view()["unavailable"])  # one PR's stream, not the account
+        self.daemon.tick(NOW + gg.NUDGE_MIN + gg.CYCLE)  # no stream: the plain cycle
+        self.assertEqual(len(self.gh.gql_calls()), 3)
+        self.assertEqual(len(self.listens()), 2)  # listened again after EVENT_RETRY
+        self.assertLessEqual(gg.EVENT_RETRY, gg.CYCLE)
+
+    def test_a_planned_end_listens_again_at_once(self) -> None:
+        self.fake("rotate")  # --timeout EVENT_LIFETIME reached: exit 8
+        gg.register(self.KEY, waited=True)
+        self.daemon.tick(NOW)
+        self.until(self.ended, "the listener to end")
+        self.daemon.tick(NOW + gg.TICK)
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertEqual(len(self.listens()), 2)
+        self.assertIn(f"--timeout {gg.EVENT_LIFETIME}s", self.listens()[0])
+
+    def test_a_wait_that_ends_stops_its_listener(self) -> None:
+        self.fake("live")
+        self.settled_pr()
+        gg.register(self.KEY, waited=True)
+        self.daemon.tick(NOW)
+        proc = self.daemon.events.streams[self.KEY]["proc"]
+        self.daemon.tick(NOW + gg.WAIT_INTEREST + gg.TICK)  # the wait timed out: nobody waits on the PR
+        self.until(lambda: proc.poll() is not None, "the listener to stop")
+        self.assertEqual(self.daemon.events.view()["live"], 0)
+        self.assertNotIn(self.KEY, self.daemon.events.streams)
+
+    def test_stop_all_leaves_no_listener(self) -> None:
+        self.fake("live")
+        gg.register(self.KEY, waited=True)
+        gg.register("pr:o/r#2", waited=True)
+        self.daemon.tick(NOW)
+        procs = [s["proc"] for s in self.daemon.events.streams.values()]
+        self.assertEqual(len(procs), 2)
+        self.daemon.events.stop_all()  # before a re-exec and at exit
+        self.until(lambda: all(p.poll() is not None for p in procs), "every listener to stop")
+
+    def test_turned_off_in_the_daemon_config(self) -> None:
+        self.fake("live")
+        gg.DAEMON_CONFIG.write_text(json.dumps({"events": False}))
+        self.addCleanup(gg.DAEMON_CONFIG.unlink)
+        gg.register(self.KEY, waited=True)
+        self.daemon.tick(NOW)
+        self.assertEqual(self.listens(), [])
+        self.assertIn("off", self.daemon.events.view()["unavailable"])
+
+    def test_no_listener_for_an_unwaited_or_finished_pr(self) -> None:
+        self.fake("live")
+        self.gh.prs[("o", "r", 3)] = pr_node(3, state="MERGED", rollup="SUCCESS")
+        gg.register("pr:o/r#2")  # read by a status, nobody waits
+        gg.register("pr:o/r#3", waited=True)
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(self.listens(), [])
 
 
 if __name__ == "__main__":

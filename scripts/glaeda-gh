@@ -13355,7 +13355,9 @@ def serve(foreground_ok: bool = False) -> int:
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
     import atexit
-    atexit.register(daemon.events.stop_all)  # a normal exit leaves no `gh event listen` behind
+    # (a test double built without Daemon.__init__ has no streams)
+    stop_streams = getattr(getattr(daemon, "events", None), "stop_all", lambda: None)
+    atexit.register(stop_streams)  # a normal exit leaves no `gh event listen` behind
     log({"event": "start", "pid": os.getpid()})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
@@ -13384,7 +13386,7 @@ def serve(foreground_ok: bool = False) -> int:
             if daemon.valve_due is not None:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
                 daemon.restart_self()
-                daemon.events.stop_all()  # its listeners are its own: the new daemon opens its own
+                stop_streams()  # its listeners are its own: the new daemon opens its own
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             changed = me.stat().st_mtime != stamp
             due = reexec_due(changed, daemon.land_busy(), daemon.reexec_waiting, time.monotonic(),
@@ -13400,14 +13402,14 @@ def serve(foreground_ok: bool = False) -> int:
                     daemon.reexec_waiting = time.monotonic()
             elif due is not None:
                 log({"event": "reexec", **({"why": due} if due != "reexec" else {})})
-                daemon.events.stop_all()  # its listeners are its own: the new daemon opens its own
+                stop_streams()  # its listeners are its own: the new daemon opens its own
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             if lock_replaced(lock):
                 # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):
                 # this daemon still polls, but its lock is on a file nobody can see, so every client reads
                 # "not running" and restart's start is a no-op on the active unit. Start over on the new path.
                 log({"event": "reexec", "why": "daemon.lock was removed or replaced"})
-                daemon.events.stop_all()  # its listeners are its own: the new daemon opens its own
+                stop_streams()  # its listeners are its own: the new daemon opens its own
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
         except OSError:
             pass

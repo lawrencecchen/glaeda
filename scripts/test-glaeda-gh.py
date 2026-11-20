@@ -22275,6 +22275,7 @@ class LandTest(Base):
         Returns REST per minute after the lift (judgments x EXPLAIN_REST_*), the judgments per minute, and when
         each PR merged."""
         self.w.config["resetJudgesPerMinute"] = per_minute
+        self.w.config["windowShare"] = {"rest": 0, "graphql": 0}  # the stagger alone (the window cap: its own test)
         self.q = self.queue()
         pending: set[str] = set()
         self.q.watch = self.q.peek = pending.add
@@ -22366,7 +22367,7 @@ class LandTest(Base):
             self.assertEqual(after["snapshots"], k, after)
         self.assertLess(out[(30, cap)]["first5Live"], out[(30, 0)]["first5Live"])
 
-    def quota_unreadable_profile(self, k: int, minutes: int, until: float) -> dict:
+    def quota_unreadable_profile(self, k: int, minutes: int, until: float, words: str = "") -> dict:
         """K due entries, no latch on this host, each judgment answered "unreadable" with the words merge_hold gives
         when the gh-quota shim refused its read: the login's GraphQL spent "until" UNTIL. Ticks MINUTES; returns the
         judgments made (each a merge_hold explain, its REST spent before the refused read) and each entry's wait."""
@@ -22374,6 +22375,8 @@ class LandTest(Base):
         reason = (f"merge-hold: refused o/r {{n}}: its head could not be read: no fresh head-matching PR answer: "
                   f"gh-quota: refused: GitHub's GraphQL rate limit is spent for login until {stamp}Z (reset); next: "
                   f"retry after {stamp}Z (reset); nothing is sent to GitHub before then (why: guard-why)")
+        if words:
+            reason = words.replace("{stamp}", stamp)  # WORDS: another wording of the same refusal, {stamp} its HH:MM
         heads = {n: format(0xB0 + n, "040x") for n in range(1, k + 1)}
         for n, head in heads.items():
             key = f"pr:o/r#{n}"
@@ -22398,6 +22401,87 @@ class LandTest(Base):
         return {"judged": len(judged), "perEntry": max(sum(1 for _, m in judged if m == n) for n in heads),
                 "waits": waits, "first5": sum(1 for at, _ in judged if at < start + 300)}
 
+    def test_the_host_cap_keeps_a_windows_judgments_under_its_share_and_judges_a_merge_ready_entry_first(self):
+        """gcp-agent-lane-1, 2026-11-20: the land queue sent 135 calls in the ten minutes after the 01:38Z reset with 31
+        entries waiting, and GraphQL is the pool that stalls every lane (the coordinator: "put the per-host, per-window
+        cap (merge-ready entries first)"). 40 entries whose judgments answer a plain "unreadable" (retried every
+        LAND_RETRY_DEFAULT) and one judged ok at its head with its merge step next: one window's judgments stay under
+        LAND_WINDOW_SHARE of each pool at LAND_JUDGE_COST each, its first ten minutes under the ramp's slice, and the
+        merge-ready entry is judged first. An entry left out says so."""
+        k = 40
+        heads = {n: format(0xC0 + n, "040x") for n in range(1, k + 2)}
+        for n, head in heads.items():
+            self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
+            self.land(f"o/r#{n}")
+        self.q.now = self.t
+        self.q.ingest()  # the requests become entries, nothing judged yet
+        ready = self.q.entries[f"pr:o/r#{k + 1}"]
+        ready["explain"] = {"at": self.t - 60, "ok": True, "code": "", "head": heads[k + 1],
+                            "action": {"kind": "merge", "sha": heads[k + 1]}}
+        judged: list[tuple[float, int]] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                n = int(argv[4])
+                judged.append((self.t, n))
+                if n == k + 1:
+                    rc, doc = ok_answer(heads[n])
+                    doc["action"]["number"] = n
+                    self.w.answers.append((rc, doc))
+                else:
+                    self.w.answers.append(refusal("unreadable", heads[n], None))
+            return real(argv, timeout, env)
+        self.q.run = run
+        start = self.t
+        while self.t < start + gg.LAND_WINDOW_S - 30:
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            self.tick(30)
+        most = min(gg.LAND_WINDOW_SHARE[p] * gg.LAND_POOL / gg.LAND_JUDGE_COST[p] for p in gg.LAND_JUDGE_COST)
+        first10 = sum(1 for at, _ in judged if at < start + 600)
+        if os.environ.get("LAND_RESET_PROFILE"):
+            print("PROFILE", json.dumps({"judged": len(judged), "first10": first10, "cap": int(most),
+                                         "first": judged[0][1] if judged else None}))
+        self.assertEqual(judged[0][1], k + 1, judged[:3])
+        self.assertLessEqual(len(judged), most)
+        self.assertLessEqual(first10, most * (600 + gg.LAND_WINDOW_RAMP) / gg.LAND_WINDOW_S + 1)
+        self.assertEqual(self.q.entries[f"pr:o/r#{k + 1}"]["state"], "merged")
+        capped = [e for e in self.q.entries.values() if e.get("windowCapped")]
+        self.assertTrue(capped)
+        self.assertIn("not judged this window: host cap", gg.land_line(capped[0], self.t, latch=None))
+
+    def test_an_entry_held_only_by_the_host_cap_is_never_stopped_by_its_wait_deadline(self):
+        """Router review of glaeda#2244, F1: the cap's waits counted toward a wait's deadline. Its 200-entry simulation
+        stopped an "unreadable" entry after four judgments over 25,470 s although its retries asked for 420 s, the rest
+        spent waiting its turn under the cap. Here 10 entries answer a plain "unreadable" (each a 120 s retry) under a
+        cap of four judgments' GraphQL a window, for longer than LAND_UNREAD_DEADLINE: none is stopped on its
+        deadline."""
+        self.w.config["windowShare"] = {"rest": 0, "graphql": 4 * gg.LAND_JUDGE_COST["graphql"] / gg.LAND_POOL}
+        k = 10
+        heads = {n: format(0xD0 + n, "040x") for n in range(1, k + 1)}
+        for n, head in heads.items():
+            self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
+            self.land(f"o/r#{n}")
+        judged: list[int] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                n = int(argv[4])
+                judged.append(n)
+                self.w.answers.append(refusal("unreadable", heads[n], None))
+            return real(argv, timeout, env)
+        self.q.run = run
+        start = self.t
+        while self.t < start + gg.LAND_UNREAD_DEADLINE + 2 * gg.LAND_WINDOW_S:
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            self.tick(60)
+        stops = {key: (e.get("stop") or {}).get("code") for key, e in self.q.entries.items() if e["state"] == "stopped"}
+        self.assertGreater(len(judged), k)  # every entry judged, some more than once: the cap opened each window
+        self.assertEqual(stops, {})
+
     def test_an_unreadable_judgment_the_quota_refused_is_parked_until_the_reset_it_names(self):
         """The broker client gcp-agent-lane-1, 2026-11-19 22:38-22:50Z: 63 judgments in 12 minutes, 30 of them
         "unreadable" with merge_hold's reason quoting the gh-quota shim ("GitHub's GraphQL rate limit is spent for
@@ -22414,6 +22498,16 @@ class LandTest(Base):
         self.assertEqual(p["perEntry"], 1, p)
         self.assertEqual(p["judged"], k, p)
         self.assertEqual(set(p["waits"].values()), {"quota"}, p)
+
+    def test_an_unreadable_judgment_in_the_brokers_rate_limited_words_is_parked_too(self):
+        """lw#6031 at 803fcf96, gcp-agent-lane-1 2026-11-20 02:02Z: "unreadable" in the broker's words ("gh api graphql
+        failed: until 02:39Z (reset); not sent, retry after 02:39Z; reason: [RATE_LIMITED]"), which LAND_UNREAD_QUOTA
+        did not read, so it took the 120 s retry until the reset."""
+        words = ("merge_hold: refused: the reds at {n} could not be read for base_red_excuse.py: RuntimeError: GraphQL: "
+                 "gh api graphql failed: until {stamp}Z (reset); not sent, retry after {stamp}Z; reason: [RATE_LIMITED] "
+                 "GitHub's GraphQL limit. Retry once GitHub answers")
+        p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
+        self.assertEqual((p["perEntry"], set(p["waits"].values())), (1, {"quota"}), p)
 
     def tearDown_entries(self) -> None:
         """A fresh queue directory for the next profile: no entry, request or latch left from the last."""

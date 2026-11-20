@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import copy
 import fcntl
@@ -742,6 +743,45 @@ class StatusStateTest(unittest.TestCase):
         gg.fold_contexts(nodes, runs, statuses, {})
         self.assertEqual(gg.head_data("b" * 40, runs, statuses, {})["statusStates"],
                          {"status / cmux-next/compile": "error"})
+
+
+class HeadRunOrderTest(unittest.TestCase):
+    """head_data's `runs` (head_data's `runs`): every check run at a head with its own id and times, over GraphQL and
+    REST alike, and `checks --json` serves it, so a reader can order a replay against its shard's newest rerun from the
+    cache (leo-workspace merge_hold's webview verdict; cmux#46128, #46236, #46782 sat 6 h on green heads)."""
+
+    @staticmethod
+    def node(name: str, ident: int, started: str, done: str, conclusion: str = "SUCCESS") -> dict:
+        return {"__typename": "CheckRun", "databaseId": ident, "name": name, "status": "COMPLETED",
+                "conclusion": conclusion, "startedAt": started, "completedAt": done,
+                "checkSuite": {"app": {"slug": "github-actions"}, "workflowRun": {"workflow": {"name": "CI"}}}}
+
+    def test_graphql_nodes_keep_every_run_with_its_id_and_times(self) -> None:
+        runs: dict = {}
+        statuses: dict = {}
+        order: dict = {}
+        gg.fold_contexts([self.node("web / react-apps-check (1)", 20, "2026-11-20T02:00:00Z", "2026-11-20T02:10:00Z"),
+                          self.node("web / react-apps-check (1)", 10, "2026-11-20T01:00:00Z", "2026-11-20T01:10:00Z",
+                                    "FAILURE")], runs, statuses, {}, order=order)
+        data = gg.head_data("a" * 40, runs, statuses, {}, order)
+        self.assertEqual(data["found"]["CI / web / react-apps-check (1)"], ["completed", "success"])
+        self.assertEqual(data["runs"]["CI / web / react-apps-check (1)"],
+                         [[10, "completed", "failure", "2026-11-20T01:00:00Z", "2026-11-20T01:10:00Z"],
+                          [20, "completed", "success", "2026-11-20T02:00:00Z", "2026-11-20T02:10:00Z"]])
+        self.assertIn("completedAt", gg.HEAD_CONTEXTS)  # the GraphQL read asks for both times
+
+    def test_rest_nodes_keep_them_too_and_no_order_writes_none(self) -> None:
+        nodes = gg.rest_contexts({"check_runs": [{"id": 7, "name": "web / react-apps-base-check", "status": "completed",
+                                                  "conclusion": "success", "started_at": "2026-11-20T03:00:00Z",
+                                                  "completed_at": "2026-11-20T03:05:00Z", "app": "github-actions"}]},
+                                 [], [], set())
+        runs: dict = {}
+        order: dict = {}
+        gg.fold_contexts(nodes, runs, {}, {}, order=order)
+        self.assertEqual(gg.head_data("b" * 40, runs, {}, {}, order)["runs"],
+                         {"github-actions / web / react-apps-base-check":
+                          [[7, "completed", "success", "2026-11-20T03:00:00Z", "2026-11-20T03:05:00Z"]]})
+        self.assertNotIn("runs", gg.head_data("b" * 40, runs, {}, {}))
 
 
 class FakeController:
@@ -2183,8 +2223,10 @@ class UpstreamTest(Base):
         key = gg.parse_key("head", f"o/r@{sha}")
         gg.register(key, consumer="compile-fallback")
         found = {"CI / compile (verdict: ok)": ["completed", "success"], "status / ci/compile": ["completed", "success"]}
+        order = {"CI / compile (verdict: ok)": [[5, "completed", "success", "2026-11-20T01:00:00Z", "2026-11-20T01:02:00Z"]]}
         now = time.time()
-        self.answers[key] = {"data": {"sha": sha, "found": found, "ids": {}, "settled": True}, "dataAt": now - 2,
+        self.answers[key] = {"data": {"sha": sha, "found": found, "ids": {}, "settled": True, "runs": order},
+                             "dataAt": now - 2,
                              "fetchedAt": now - 2, "budgets": {"compile-fallback": {"spent": 1, "limit": 3,
                                                                                     "deniedAt": None}}}
         self.daemon.tick(now=NOW)
@@ -2203,6 +2245,7 @@ class UpstreamTest(Base):
         doc = json.loads(out.getvalue())
         self.assertEqual(code, gg.EXIT_OK)
         self.assertEqual(doc["heads"][sha]["found"], found)
+        self.assertEqual(doc["heads"][sha]["runs"], order)  # each run's id and times (head_data's `runs`)
         self.assertTrue(doc["heads"][sha]["settled"])
         # an upstream older than head keys refuses a request that has one: the PRs' read is a request of its own
         gg.register("pr:o/r#7")
@@ -19554,6 +19597,9 @@ class LandWorld:
             raise LandCrash(argv)
         if argv[1:3] == [self.mh, "explain"]:
             rc, doc = self.answers.pop(0)
+            if "--cache-only" in argv:  # as merge_hold marks a cache-only answer (its explain_main)
+                doc = {**doc, "cacheOnly": True,
+                       "cacheMiss": doc.get("cacheMiss", doc.get("code") in ("quota", "unreadable", "regen_retry"))}
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -22510,10 +22556,12 @@ class LandTest(Base):
         judged: list[tuple[float, int]] = []
         real = self.w.run
 
+        cached: list[tuple[float, int]] = []  # cache-only judgments (LAND_CACHE_ONLY_MAX_AGE): charged nothing
+
         def run(argv, timeout, env):
             if argv[1:3] == [self.w.mh, "explain"]:
                 n = int(argv[4])
-                judged.append((self.t, n))
+                (cached if "--cache-only" in argv else judged).append((self.t, n))
                 if n == k + 1:
                     rc, doc = ok_answer(heads[n])
                     doc["action"]["number"] = n
@@ -22536,6 +22584,8 @@ class LandTest(Base):
         self.assertLessEqual(len(judged), most)
         self.assertLessEqual(first10, most * (600 + gg.LAND_WINDOW_RAMP) / gg.LAND_WINDOW_S + 1)
         self.assertEqual(self.q.entries[f"pr:o/r#{k + 1}"]["state"], "merged")
+        # GraphQL is the pool capped first: each entry it leaves out is judged once from the caches, which miss here
+        self.assertLessEqual(max(collections.Counter(n for _, n in cached).values(), default=0), 1)
         capped = [e for e in self.q.entries.values() if e.get("windowCapped")]
         self.assertTrue(capped)
         self.assertIn("not judged this window: host cap", gg.land_line(capped[0], self.t, latch=None))
@@ -22570,6 +22620,50 @@ class LandTest(Base):
         stops = {key: (e.get("stop") or {}).get("code") for key, e in self.q.entries.items() if e["state"] == "stopped"}
         self.assertGreater(len(judged), k)  # every entry judged, some more than once: the cap opened each window
         self.assertEqual(stops, {})
+
+    def test_an_entry_capped_only_for_graphql_is_judged_from_the_caches(self):
+        """The coordinator, 2026-11-20: right after the GraphQL reset glaeda land held PRs "not judged this window: host
+        cap (graphql)" while their webview verdict was a cache read away (cmux#46128, #46236, #46782 had sat 6 h on
+        unreadable live reads). An entry the cap leaves out only for GraphQL is judged `explain --cache-only` and
+        charged nothing: a cache "ok" merges (the shim judges the merge live), a miss keeps its place under the cap,
+        named, with no strike."""
+        self.w.config["windowShare"] = {"rest": 0, "graphql": 1 * gg.LAND_JUDGE_COST["graphql"] / gg.LAND_POOL}
+        heads = {n: format(0xE0 + n, "040x") for n in range(1, 4)}
+        for n, head in heads.items():
+            self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
+            self.land(f"o/r#{n}")
+        seen: list[tuple[int, bool]] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                n = int(argv[4])
+                seen.append((n, "--cache-only" in argv))
+                if n == 2:
+                    rc, doc = ok_answer(heads[n])
+                    doc["action"]["number"] = n
+                    self.w.answers.append((rc, doc))
+                else:
+                    self.w.answers.append(refusal("unreadable", heads[n], None,
+                                                  reason="cache-only: not held in this host's caches"))
+            return real(argv, timeout, env)
+        self.q.run = run
+        for _ in range(6):
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            self.tick(30)
+        live = [n for n, only in seen if not only]
+        cached = [n for n, only in seen if only]
+        self.assertLessEqual(len(live), 1, seen)  # the window's GraphQL share (under the ramp: none at first)
+        self.assertIn(2, cached + live)
+        self.assertEqual(self.q.entries["pr:o/r#2"]["state"], "merged")
+        missed = [self.q.entries[f"pr:o/r#{n}"] for n in (1, 3) if n not in live]
+        self.assertTrue(missed)
+        for e in missed:
+            self.assertNotEqual(e["state"], "stopped")
+            self.assertIn("not judged this window: host cap (graphql", gg.land_line(e, self.t, latch=None))
+            self.assertEqual(sum(1 for n, only in seen if only and f"pr:o/r#{n}" == e["key"]), 1)  # once a window
+        self.assertLessEqual(gg.read_json(gg.land_dir() / "window.json")["graphql"], gg.LAND_JUDGE_COST["graphql"])
 
     def test_an_unreadable_judgment_the_quota_refused_is_parked_until_the_reset_it_names(self):
         """The broker client gcp-agent-lane-1, 2026-11-19 22:38-22:50Z: 63 judgments in 12 minutes, 30 of them

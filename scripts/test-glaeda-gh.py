@@ -19563,6 +19563,8 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
         self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
         self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
+        # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
+        self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
 
     def test_tip_merge_update_branch_head_race_then_merge(self):
         self.pr(LA)
@@ -20645,7 +20647,7 @@ class LandTest(Base):
         self.tick()
         es = self.q.entries
         self.assertEqual([es[f"pr:o/r#{n}"]["state"] for n in (3, 2, 1)], ["stopped", "waiting_after", "waiting_after"])
-        told = {m[3]: m[4] for m in self.w.sent()}
+        told = {m[3]: m[-1] for m in self.w.sent()}
         self.assertIn("o/r#3, which it lands after, stopped (block)", told["host/two"])
         self.assertIn("next: glaeda-gh land o/r#3", told["host/two"])
         self.assertNotIn("host/one", told)  # #1 waits on #2, which is still queued

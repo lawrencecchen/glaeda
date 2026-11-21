@@ -14021,8 +14021,38 @@ def land_queued_by() -> str:
     return reader if "/" in reader else f"{policy_host()}/{reader}"
 
 
-def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool) -> int:
+def pr_head_sha(repo: str, number: int) -> str | None:
+    """The PR's head commit now (`gh api repos/R/pulls/N --jq .head.sha`, which the host's shim answers from the
+    daemon's cache), or None when it cannot be read."""
+    try:
+        done = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{number}", "--jq", ".head.sha"],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = done.stdout.strip()
+    return sha if done.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def check_land_pin(repo: str, number: int, pin: str | None) -> None:
+    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): refuse when the PR's head is not SHA
+    (a full or abbreviated one), so a land never takes a push that came after the one the caller judged."""
+    if not pin:
+        return
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
+        raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
+    head = pr_head_sha(repo, number)
+    if head is None:
+        raise WatchError(f"cannot read {repo}#{number}'s head to check --match-head-commit {pin[:12]}; "
+                         f"next: glaeda-gh status pr {repo}#{number}")
+    if not head.startswith(pin.lower()):
+        raise WatchError(f"{repo}#{number}'s head moved: it is {head[:12]}, not {pin[:12]}; "
+                         f"next: glaeda-gh land {repo}#{number} --match-head-commit {head}")
+
+
+def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
+             pin: str | None = None) -> int:
     key, repo, number = land_key(target)
+    check_land_pin(repo, number, pin)
     for a in after:
         land_key(a)
     requester, source = land_requester_from(notify)
@@ -23583,6 +23613,26 @@ def cmd_on_event_replay(run_file: Path, jobs_file: Path | None, wait: float, as_
     return EXIT_OK
 
 
+REPO_ONLY_RE = re.compile(rf"({NAME})/({NAME})")
+
+
+def join_repo_and_number(raw: list[str]) -> list[str] | None:
+    """`wait run OWNER/REPO RUN_ID`, `wait pr OWNER/REPO N` (also status, and `land OWNER/REPO N`): the repository and
+    the number as two words, joined into the one target the command takes (coordinator, 2026-11-21: `glaeda-gh wait run
+    manaflow-ai/cmuxterm-hq 44884634507` failed "unrecognized arguments"). None when the words are not that shape."""
+    cmd, rest = raw[0], raw[1:]
+    kind = ""
+    if cmd != "land":
+        if len(rest) < 3 or rest[0] not in ("pr", "run"):
+            return None
+        kind, rest = rest[0], rest[1:]
+    if len(rest) < 2 or not REPO_ONLY_RE.fullmatch(rest[0]) or not re.fullmatch(r"#?\d+", rest[1]):
+        return None
+    number = rest[1].lstrip("#")
+    target = f"{rest[0]}/{number}" if kind == "run" else f"{rest[0]}#{number}"
+    return [cmd] + ([kind] if kind else []) + [target] + rest[2:]
+
+
 def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     """`wait|status|land` called without the kind run as the call meant (fewer-tool-calls).
 
@@ -23600,6 +23650,9 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
             raw = raw[:slot] + [f"{raw[slot]}#{raw[slot + 1].lstrip('#')}"] + raw[slot + 2:]
             joined = True
     cmd, first = raw[0], raw[1]
+    joined = join_repo_and_number(raw)
+    if joined:
+        return joined, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + joined)}`"
     if cmd == "land":
         if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
@@ -23789,6 +23842,8 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
                     help="who is told on a merge or a stop (with no value, and by default, this "
                          "host/$ACPMUX_SESSION_NAME)")
+    ld.add_argument("--match-head-commit", dest="match_head", metavar="SHA",
+                    help="land only while the PR's head is SHA (a push after it refuses; gh pr merge's own flag)")
     ld.add_argument("--wait", type=seconds, default=0, metavar="S",
                     help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going)")
     ld.add_argument("--json", action="store_true")
@@ -23930,7 +23985,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("land takes one OWNER/REPO#N (more PRs: one land each, --after to order them)")
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
-            return cmd_land(words[0], args.after, args.notify, args.wait, args.json)
+            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.match_head)
         if args.command == "on-event":
             if args.action == "replay":
                 if args.run_file is None or args.wait < 0:

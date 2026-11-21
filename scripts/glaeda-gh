@@ -11565,9 +11565,12 @@ class LandQueue:
         except WatchError:
             pin = ""
         if pin:
-            e["pinSha"] = pin
+            e.update(pinSha=pin, pinSince=self.now)  # pin_wait: judged only once a read since this request shows it
         else:
             e.pop("pinSha", None)
+            e.pop("pinSince", None)
+        e.pop("pinWait", None)
+        e.pop("pinSeen", None)
         if req.get("lane"):
             e.update(lane=str(req["lane"]), laneHost=str(req.get("laneHost") or ""))
         elif "lane" in req:  # a session-less re-request of an open entry (an --after added) keeps its lane
@@ -12586,6 +12589,8 @@ class LandQueue:
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
+        if e.get("pinSha") and not e.get("pinSeen") and self.pin_wait(e, c or {}, head):
+            return
         running = land_checks_running(data, head)
         kind = w.get("kind")
         if e["state"] == "queued":
@@ -12652,6 +12657,55 @@ class LandQueue:
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
+
+    def pin_wait(self, e: dict, c: dict, head: str) -> bool:
+        """A land pinned with --sha/--match-head-commit (E's pinSha): True while E waits for a read of its PR made since
+        the request, or when it stopped because that read shows another head. huge-blue, 2026-11-21 10:56Z:
+        leo-workspace#7221, pinned at 53fa5568 just pushed, was judged within a minute on the cache's 5-minute-old copy
+        of 0eb40dbac8fb and stopped on that head's conflict; the pin said a newer head existed. Until the cache shows
+        the pinned head, or a read since the request shows another, no verdict on a cached head is taken (judge's own
+        head_moved included): the PR is read again (nudged, or refreshed through the upstream), at most every
+        NUDGE_MIN. Once the cache shows the pin (pinSeen), judge's head_moved check holds as it always did."""
+        pin = str(e.get("pinSha") or "")
+        if head and not land_head_moved(pin, head):
+            e["pinSeen"] = True
+            if e.pop("pinWait", None) is not None:
+                self.history(e, "pin_seen", head=head[:12])
+            self.save(e)
+            return False
+        since = float(e.get("pinSince") or 0)
+        reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
+                 and not isinstance(t, bool)]
+        if head and reads and max(reads) >= since:
+            # GitHub, read since the request, says the head is not the pinned one: the pin refuses (as judge does)
+            e.pop("pinWait", None)
+            self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
+            return True
+        w = e.get("pinWait")
+        if not isinstance(w, dict):
+            w = e["pinWait"] = {"since": self.now, "cached": head[:12]}
+            self.history(e, "pin_wait", pin=pin[:12], cached=head[:12])
+            self.save(e)
+        last = w.get("readAt")
+        if not isinstance(last, (int, float)) or isinstance(last, bool) or self.now - last >= NUDGE_MIN:
+            if not self.reads_upstream():
+                w["readAt"] = self.now
+                self.save(e)
+                before = (c.get("dataAt"), c.get("updatedAtAt"))
+                self.nudge(e["key"])
+                again = self.cache_of(e["key"]) or {}  # a read the nudge already answered (the daemon's own pass)
+                if (again.get("dataAt"), again.get("updatedAtAt")) != before:
+                    # judged from that read on the next pass (consider holds this pass's copy), or stopped now
+                    self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
+                    self.changed_entries.add(e["key"])
+                    return True
+            elif len(self.jobs) < self.workers():  # no free worker: read on a later pass
+                w["readAt"] = self.now
+                e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None}
+                self.submit(e["key"], self.refresh_job, e["key"])
+            self.save(e)
+        return True
 
     def after_stopped(self, e: dict, a: str, ae: dict) -> bool:
         """E lands after A, whose land stopped (LAND_AFTER_STOPPED_WAIT): E keeps waiting for A, telling its requester

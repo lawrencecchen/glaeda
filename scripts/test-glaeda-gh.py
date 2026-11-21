@@ -4899,6 +4899,39 @@ class ClientTest(Base):
         self.assertIn(".out.state", gg.WAIT_FILES)
         self.assertIn('$out.state', gg.BLOCKER)
 
+    def test_status_reads_a_key_nobody_watches_directly_once_when_the_wait_ends_empty(self) -> None:
+        """A key the daemon has not read when status's wait ends gets one direct read (as wait's starved branch),
+        then status answers from the cache; a refused read (quota, upstream) leaves the old "no data yet" (3)."""
+        reads: list[dict] = []
+
+        def fill(req: dict) -> None:
+            reads.append(req)
+            self.put(req["key"], gg.parse_pr(pr_node(7, rollup="SUCCESS", checks=[check_run("a")])))
+            return None
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=fill), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_status("pr", "o/r#7", False, True, first_wait=0), 0)
+        self.assertEqual([r["key"] for r in reads], ["pr:o/r#7"])
+        self.assertEqual(json.loads(out.getvalue())["data"]["checkState"], "SUCCESS")
+        # a key whose cache already answers is never read again, and a refusal is not an answer
+        reads.clear()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=lambda req: reads.append(req) or gg.DIRECT_QUOTA), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_status("pr", "o/r#7", False, True, first_wait=0), 0)
+            self.assertEqual(reads, [])
+            self.assertEqual(gg.cmd_status("pr", "o/r#8", False, True, first_wait=0), gg.EXIT_DOWN)
+        self.assertEqual([r["key"] for r in reads], ["pr:o/r#8"])
+
     def test_status_says_not_found_and_could_not_judge_apart(self) -> None:
         self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
         self.put("pr:o/r#5", None, error="graphql: HTTP 502")
@@ -5276,7 +5309,9 @@ class ClientTest(Base):
 
     def status(self, *args, **kwargs) -> tuple[int, str]:
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        # these tests are about the daemon's cache: a refused direct read keeps them off GitHub (the fallback is
+        # test_status_reads_a_key_nobody_watches_directly_once_when_the_wait_ends_empty)
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "direct_read", return_value=gg.DIRECT_QUOTA):
             code = gg.cmd_status(*args, first_wait=0, **kwargs)
         return code, out.getvalue()
 
@@ -5360,6 +5395,8 @@ class ClientTest(Base):
         for row in rows.values():  # no row is the all-blank row that started this
             self.assertFalse(row.endswith("\t\t\t"), row)
         # and the reason plus its next step, per unanswered row, on fd 2 (say_waiting), not mixed into the table
+        # (the direct-read fallback's own two lines about #3 are not part of that contract)
+        said = [line for line in said if "directly once" not in line and "direct read failed" not in line]
         self.assertEqual(len(said), 2, said)
         self.assertIn("o/r#3: the daemon has not read it from GitHub yet", said[0])
         self.assertIn("next: glaeda-gh wait pr o/r#3 --timeout 600", said[0])

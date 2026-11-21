@@ -18343,10 +18343,21 @@ class LandSnapshotTest(Base):
                                                                                                   "databaseId": 77}}}),
                 {"__typename": "StatusContext", "context": "ws-check", "state": "PENDING", "description": "queued"}])
             gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
-        self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, tick=lambda now=None: None,
+        self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, tick=lambda now=None, *, dirty=None: None,
                                           reap=lambda: None,
                                           entries={f"pr:o/r#{n}": {"state": "queued"} for n in range(1, self.N + 1)})
         self.daemon.land_queue = self.land
+
+    def test_changed_cached_check_wakes_a_waiting_land(self) -> None:
+        key = "pr:o/r#1"
+        head = {"headRefOid": "a" * 40, "state": "OPEN", "checks": []}
+        self.daemon.store(key, None, data=head)
+        self.assertIn(key, self.daemon.land_dirty)
+        self.daemon.land_dirty.clear()
+        self.daemon.store(key, None, data=dict(head))
+        self.assertNotIn(key, self.daemon.land_dirty)
+        self.daemon.store(key, None, data={**head, "checks": [{"name": "ci", "status": "COMPLETED"}]})
+        self.assertIn(key, self.daemon.land_dirty)
 
     def cycle(self, k: int) -> dict:
         at = NOW + gg.CYCLE * k
@@ -20929,6 +20940,77 @@ class LandTest(Base):
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
         self.w.answers.append(ok_answer(LA))
         self.tick()
+        self.assert_merged_at(LA)
+
+    def test_an_unchanged_wait_skips_land_consider_until_recovery(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 900}))
+        self.tick()
+        calls = []
+        consider = self.q.consider
+        self.q.consider = lambda entry: (calls.append(entry["key"]), consider(entry))[1]
+        self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP
+        self.t += 30
+        self.q.tick(self.t, dirty=set())
+        self.assertEqual(calls, [])
+        self.q.recovery_at = self.t
+        self.t += 1
+        self.q.tick(self.t, dirty=set())
+        self.assertEqual(calls, [self.KEY])
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_dirty_land_key_wakes_its_entry_before_the_recovery_sweep(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 900}))
+        self.tick()
+        calls = []
+        consider = self.q.consider
+        self.q.consider = lambda entry: (calls.append(entry["key"]), consider(entry))[1]
+        self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP
+        self.t += 1
+        self.q.tick(self.t, dirty=set())
+        self.assertEqual(calls, [])
+        dirty = {self.KEY}
+        self.q.tick(self.t + 1, dirty=dirty)
+        self.assertEqual(calls, [self.KEY])
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_direct_readers_cache_write_wakes_a_quiet_land(self):
+        self.daemon.land_queue = self.q
+        self.daemon.clock_real = False
+        self.daemon.now = self.t
+        self.q.cache_of = gg.read_cache
+        self.land()
+        self.daemon.store(self.KEY, None, data=land_pr(LA), dataAt=self.t)
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 900}
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.daemon.land_tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
+
+        writer = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)
+        writer.now = self.t + 1
+        writer.store(self.KEY, None, data=land_pr(LA, state="MERGED"), dataAt=writer.now)
+        self.daemon.now = self.t + 2
+        self.daemon.land_tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_changed_wait_retries_when_the_quota_window_has_room(self):
+        self.pr(LA)
+        self.land()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 900}
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(self.q, "window_room", return_value=False):
+            self.q.tick(self.t + 1, dirty={self.KEY})
+        self.assertEqual(len(self.w.explains()), 1)
+        self.q.tick(self.t + 2, dirty=set())
         self.assert_merged_at(LA)
 
     def test_a_wait_verdict_is_kept_while_its_head_and_checks_hold(self):

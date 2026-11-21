@@ -8549,6 +8549,105 @@ def cap_label_set(receipt: frozenset[str] | None, observed: frozenset[str]) -> f
     return receipt | observed
 
 
+# hq#16544: observed_labels only sees the controller feed's recent history (a fixed window of a few hours), so a
+# runner that has taken no job of a drifted label for a while would fall back to `receipt | nothing` - the
+# understating receipt - which is exactly the stranding hq#16433 is about. So what GitHub was seen to dispatch is
+# remembered per runner, with each label's last sighting, and expires only if GitHub stops dispatching it for
+# OBSERVED_LABEL_TTL_S. A runner's label set changes only by a deliberate --apply, so remembering it for days is
+# sound. It stays a widening of what the gate will *consider*: every consumer tests
+# `set(job["labels"]) <= cap_labels` and take_capacity's admission is untouched, so a remembered label can make a
+# takeable job visible but can never admit a job the runner may not run. The one cost of a label kept too long is
+# that the gate may listen for, or hold its starved reserve for, a job GitHub then declines to hand it: bounded by
+# starved_step's own max_hold_s each time, and ended by the TTL, since a runner relabelled away from a label stops
+# being dispatched it. That is the trade the TTL sets - an idle listen for at most a week against a mini that
+# strands itself for as long as its receipt is wrong.
+OBSERVED_LABEL_SCHEMA = 1
+OBSERVED_LABEL_TTL_S = float(os.environ.get("GLAEDA_RUNNER_OBSERVED_LABEL_TTL_S") or 7 * 86400.0)
+OBSERVED_LABEL_REFRESH_S = 3600.0  # a label already remembered restamps at most this often: one small write an hour
+OBSERVED_LABEL_MAX = 64  # AGENTS.md: a state file stays bounded, whatever a feed says
+OBSERVED_LABEL_MAX_BYTES = 16 * 1024
+
+
+def write_atomic(path: Path, body: str) -> None:
+    """Replace path with body, or leave it as it was. A tmp file names this writer (pid and thread), so two gates
+    never share one, and a failed write unlinks its own: a state dir that is full or read-only for a while must not
+    collect one leftover per look. Failure is silent by design at both call sites - a state file this gate writes
+    only speeds up the next look, so losing one costs nothing the gate decides."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def observed_label_file(state_dir: Path, runner_dir: Path) -> Path:
+    return state_dir / f"observed-labels-{runner_dir.name}.json"
+
+
+def load_observed_labels(path: Path, name: str | None, now: float) -> dict[str, float]:
+    """What this runner was seen to be dispatched, label -> when last seen, as far as the file is still believable:
+    its own runner name (a runner dir re-registered under another name inherits nothing) and inside the TTL.
+    The receipt deliberately does not retire an entry. Any `glaeda-cmux-runner --apply` pass rewrites a receipt
+    (on 2026-11-21 one mini's higher-index instances were rewritten while instances 1 and 2 kept a stale one), so
+    retiring on that would hand the understating receipt back its authority on a routine pass - hq#16544 itself. A
+    real relabel away from a label also stops GitHub dispatching it, so the TTL is what retires it."""
+    if not name:
+        return {}
+    try:
+        raw = read_bounded(path, OBSERVED_LABEL_MAX_BYTES)
+        doc = json.loads(raw.decode("utf-8")) if raw is not None else None
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(doc, dict) or doc.get("schema") != OBSERVED_LABEL_SCHEMA or doc.get("name") != name:
+        return {}
+    seen = doc.get("labels")
+    if not isinstance(seen, dict):
+        return {}
+    floor = now - OBSERVED_LABEL_TTL_S
+    out: dict[str, float] = {}
+    for label, at in seen.items():
+        if isinstance(label, str) and label and isinstance(at, (int, float)) and not isinstance(at, bool) \
+                and at > floor and at <= now + OBSERVED_LABEL_REFRESH_S:
+            out[label] = float(at)
+    return out
+
+
+def merge_observed_labels(remembered: dict[str, float], observed: frozenset[str],
+                          now: float) -> tuple[dict[str, float], bool]:
+    """(what to remember now, whether that is worth a write). A sighting of a label already remembered restamps it
+    at most every OBSERVED_LABEL_REFRESH_S, so a steady runner writes this file about once an hour, not once a
+    look."""
+    merged, write = dict(remembered), False
+    for label in observed:
+        prior = merged.get(label)
+        if prior is None or now - prior >= OBSERVED_LABEL_REFRESH_S:
+            write = True
+        merged[label] = now
+    if len(merged) > OBSERVED_LABEL_MAX:  # the most recently dispatched win; a label pushed out is simply forgotten
+        merged = dict(sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))[:OBSERVED_LABEL_MAX])
+        write = True
+    if set(merged) != set(remembered):
+        write = True
+    return merged, write
+
+
+def save_observed_labels(path: Path, name: str, labels: dict[str, float]) -> None:
+    """Atomic; a failed write only costs the next look the sighting, so nothing the gate decides changes."""
+    doc = {"schema": OBSERVED_LABEL_SCHEMA, "name": name, "at": gate_stamp(time.time()),
+           "labels": {label: round(at, 3) for label, at in sorted(labels.items())}}
+    body = json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n"
+    # A GitHub label may be long enough that OBSERVED_LABEL_MAX of them exceed the read bound, which would make every
+    # later look reject the file and write it again. The write is bounded by the same number the read is, so a file
+    # this gate wrote is always one it can read back; the labels dropped are the least recently dispatched.
+    while len(body.encode("utf-8")) > OBSERVED_LABEL_MAX_BYTES and doc["labels"]:
+        doc["labels"].pop(min(doc["labels"], key=lambda label: (doc["labels"][label], label)))
+        body = json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n"
+    write_atomic(path, body)
+
+
 def _feed_time(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -10225,6 +10324,13 @@ class Gate:
         self.cap_summary: dict[str, Any] | None = None
         self.cap_labels: frozenset[str] | None = None
         self.cap_label_drift: list[str] = []  # labels GitHub dispatched here that the receipt does not list
+        # hq#16544: cap_labels is widened by what GitHub was *remembered* to dispatch (OBSERVED_LABEL_TTL_S), which
+        # reveals takeable work and never admits anything (see cap_label_set). But one consumer reads a label to
+        # *lower* the room it keeps - ios_sim_wanted listens at this runner's own fit (3) instead of the side label's
+        # costliest job (5) - and there a label kept past a real relabel would shrink that room for up to the TTL,
+        # the very thing HEAD_FIT/IOS_SIM_OWN_FIT exist to prevent. So the live feed window alone (what main read)
+        # decides that: memory widens what the gate looks for, never the room it keeps.
+        self.cap_fit_labels: frozenset[str] | None = None
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
         self.reserve_demand_at: float | None = None  # RESERVE_ON_DEMAND: when the feed last showed a job for it
@@ -10519,11 +10625,7 @@ class Gate:
                 if summary is None:
                     summary = load_cap_fetch(now)
                     if summary is not None:
-                        with contextlib.suppress(OSError):
-                            tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
-                            tmp.write_text(json.dumps(summary, separators=(",", ":")))
-                            os.replace(tmp, path)
-                self.cap_summary = summary
+                        write_atomic(path, json.dumps(summary, separators=(",", ":")))
                 # hq#16433: the receipt holds the labels this host asked GitHub for, not the ones GitHub kept, and it
                 # stamps "GitHub labels could not be read; re-registering with the supplied token" when it could not
                 # confirm them. cmux-austin-mini-0-glaeda-1 and cmux-austin-mini-1-glaeda-1 read side-light while
@@ -10531,10 +10633,24 @@ class Gate:
                 # `set(job["labels"]) <= self.cap_labels`, so those two could not see a single queued job of a label
                 # they serve: no reserve, no urgent listen, no starved-job answer. What GitHub dispatched is proof.
                 observed = observed_labels(summary, name)
-                self.cap_labels = cap_label_set(receipt, observed)
+                # hq#16544: the feed only holds a few hours, so a runner that has taken no job of a drifted label
+                # for a while would fall back to `receipt | nothing` - the understating receipt - and strand itself
+                # again. So each sighting is remembered (load/merge/save_observed_labels) until the TTL or the next
+                # relabel's receipt retires it, and the gate reasons with the whole remembered set.
+                known = observed
+                if name:
+                    store = observed_label_file(self.state_dir, self.runner_dir)
+                    remembered = load_observed_labels(store, name, now)
+                    merged, write = merge_observed_labels(remembered, observed, now)
+                    if write:
+                        save_observed_labels(store, name, merged)
+                    known = frozenset(merged)
+                self.cap_summary = summary
+                self.cap_fit_labels = cap_label_set(receipt, observed)
+                self.cap_labels = cap_label_set(receipt, known)
                 # Drift is a receipt understating itself. With no readable receipt there is nothing to disagree with,
                 # so that is not published as drift: it would report the runner's whole label set as a disagreement.
-                drift = sorted(observed - receipt)[:GATE_LABEL_DRIFT_MAX] if receipt is not None else []
+                drift = sorted(known - receipt)[:GATE_LABEL_DRIFT_MAX] if receipt is not None else []
                 if drift != self.cap_label_drift:
                     self.cap_label_drift = drift
                     if drift:
@@ -10542,7 +10658,7 @@ class Gate:
             except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                 self.cap_summary = None
                 if receipt is not None:  # the feed could not say; reason with the receipt alone, as before
-                    self.cap_labels = receipt
+                    self.cap_labels = self.cap_fit_labels = receipt
                 gate_log(f"the host load cap's feed look failed ({type(error).__name__}); not holding for it")
 
         self.cap_thread = threading.Thread(target=look, name="load-cap", daemon=True)
@@ -10663,7 +10779,12 @@ class Gate:
         wanted = False
         if simulator_host(self.state_dir):
             self.cap_look()
-            wanted = ios_sim_queued(self.cap_summary, self.cap_labels, time.time())
+            # hq#16544: carrying the label is read from the live window (cap_fit_labels), because this answer
+            # *lowers* the room this listener keeps; whether the queued job is takeable is read from the whole
+            # remembered set, where a wider answer only reveals work.
+            carried = self.cap_fit_labels or frozenset()
+            wanted = IOS_SIM_RUNNER_LABEL in carried and ios_sim_queued(self.cap_summary, self.cap_labels,
+                                                                        time.time())
         if wanted != self.ios_sim_own:
             gate_log(f"a queued job needs {IOS_SIM_RUNNER_LABEL}: listening at this runner's own fit, not the side "
                      "label's costliest job" if wanted else

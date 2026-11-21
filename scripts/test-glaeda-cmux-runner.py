@@ -9025,6 +9025,24 @@ class HostLoadCapTest(unittest.TestCase):
                          "only 2 of 14 capacity units on this mini are free; its next job needs 3",
                          "it still needs room for its own job")
 
+    def test_a_remembered_label_never_shrinks_the_room_a_listener_keeps(self) -> None:
+        # hq#16544: memory widens cap_labels, which reveals takeable work and admits nothing - except that
+        # ios_sim_wanted reads a label to listen at this runner's own fit (3) instead of the side label's costliest
+        # job (5). A glaeda-ios-sim remembered past a real relabel would shrink the room this listener keeps for up
+        # to OBSERVED_LABEL_TTL_S, the very failure HEAD_FIT and IOS_SIM_OWN_FIT exist to prevent. So that one
+        # answer is read from the live feed window (cap_fit_labels), never from memory.
+        side = ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-std-xcode-26.6"]
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1"),
+                     self.job("queued", labels=self.IOS_SIM_JOB, ago=4 * 3600)]
+        gate = self.side_gate(10, side)
+        hook.save_observed_labels(hook.observed_label_file(self.state, self.runner), "cmux21-glaeda-2",
+                                  {hook.IOS_SIM_RUNNER_LABEL: time.time() - 60})
+        self.assertEqual(self.full(gate), "only 4 of 14 capacity units on this mini are free; its next job needs 5",
+                         "a remembered glaeda-ios-sim does not lower the fit this listener holds for")
+        self.assertIn(hook.IOS_SIM_RUNNER_LABEL, gate.cap_labels, "though it still makes that job visible")
+        self.assertNotIn(hook.IOS_SIM_RUNNER_LABEL, gate.cap_fit_labels,
+                         "the live window is what the lowering answer reads")
+
     def test_a_side_listener_never_takes_a_queue_head_it_cannot_start(self) -> None:
         # HEAD_FIT, 2026-11-17: cmux#44505's generated files (job 134087426027) reached cmux18-glaeda-8, which
         # listened at the side fit with 1 unit free; the job needed 8, waited 19 min for them in "Set up runner" and
@@ -9172,6 +9190,78 @@ class HostLoadCapTest(unittest.TestCase):
             self.join()
         self.assertEqual(seen, [frozenset({"glaeda-mini", self.SIDE_LIGHT, self.LABEL})],
                          "the label GitHub dispatched is still there mid-read")
+
+    def test_a_label_github_dispatched_is_remembered_past_the_feeds_window(self) -> None:
+        # hq#16544, the gap left by hq#16433's union: load_cap_fetch asks the controller for
+        # recent=HOST_LOAD_CAP_RECENT_S (600 s), so a job that finished more than 10 minutes ago is simply not in
+        # the answer and observed_labels is empty again. Union with nothing is the understating receipt, so the mini
+        # would strand itself the moment it went quiet on the drifted label - exactly the state the 2026-11-21
+        # austin minis were in. The sighting is remembered, so cap_labels keeps the label with no recent job at all.
+        self.receipt(["glaeda-mini", self.SIDE_LIGHT])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
+        self.poll()
+        self.join()  # poll's last look is still reading; the next one would be skipped as one already runs
+        self.assertIn(self.LABEL, self.gate.cap_labels, "the dispatch is seen while the feed still shows it")
+        store = hook.observed_label_file(self.state, self.runner)
+        self.assertTrue(store.exists(), "the sighting is written down, not only held in this process")
+
+        self.jobs = [self.job("queued")]  # 11 minutes on: the controller's window no longer carries that job
+        self.gate.cap_feed_at = 0.0
+        self.gate.load_capped()
+        self.join()
+        self.assertEqual(hook.observed_labels(self.gate.cap_summary, "cmux21-glaeda-2"), frozenset(),
+                         "the feed itself has forgotten the job, which is the whole premise")
+        self.assertIn(self.LABEL, self.gate.cap_labels, "the gate has not: a remembered label outlives the window")
+        self.assertEqual(self.gate.cap_label_drift, [self.LABEL], "and it is still published as a disagreement")
+        self.assertTrue(hook.label_queued(self.gate.cap_summary, self.gate.cap_labels, time.time()),
+                        "so the queued job of that label is still visible to the reserve")
+
+        self.assertIn(self.LABEL, hook.load_observed_labels(store, "cmux21-glaeda-2", time.time()),
+                      "the sighting is on disk, so it survives this gate's process")
+        self.join()
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state)  # the gate a restart (a hook rollout, a reboot) leaves behind
+        self.poll()
+        self.join()
+        self.assertIn(self.LABEL, self.gate.cap_labels,
+                      "a restarted gate reads the sighting back, so it never has to relearn it from a dispatch")
+
+    def test_a_remembered_label_is_dropped_only_by_its_ttl_or_a_new_runner_name(self) -> None:
+        now = self.NOW
+        store = self.tmp / "observed-labels-x.json"
+        hook.save_observed_labels(store, "cmux21-glaeda-2", {self.LABEL: now - 60, "glaeda-mini": now - 60})
+        self.assertEqual(sorted(hook.load_observed_labels(store, "cmux21-glaeda-2", now)),
+                         ["glaeda-mini", self.LABEL], "a round trip keeps what was seen")
+        self.assertEqual(hook.load_observed_labels(store, "cmux21-glaeda-3", now), {},
+                         "a runner dir registered under another name inherits nothing")
+        self.assertEqual(hook.load_observed_labels(store, None, now), {})
+        self.assertEqual(hook.load_observed_labels(self.tmp / "nothing.json", "cmux21-glaeda-2", now), {},
+                         "no file is no memory, not an error")
+        old = now + hook.OBSERVED_LABEL_TTL_S + 60
+        self.assertEqual(hook.load_observed_labels(store, "cmux21-glaeda-2", old), {},
+                         "a label GitHub has not dispatched for the whole TTL is forgotten: a real relabel away "
+                         "from a label also stops its dispatches")
+        store.write_text("{not json")
+        self.assertEqual(hook.load_observed_labels(store, "cmux21-glaeda-2", now), {}, "a broken file is no memory")
+
+    def test_remembering_a_steady_label_is_not_a_write_every_look(self) -> None:
+        # The look runs once a minute on every gate on the mini. Restamping on each one would be a pointless write a
+        # minute per runner; the TTL only needs the stamp to be fresher than OBSERVED_LABEL_TTL_S.
+        now = self.NOW
+        merged, write = hook.merge_observed_labels({}, frozenset({self.LABEL}), now)
+        self.assertEqual((merged, write), ({self.LABEL: now}, True), "a label never seen before is worth a write")
+        merged, write = hook.merge_observed_labels(merged, frozenset({self.LABEL}), now + 60)
+        self.assertEqual((merged, write), ({self.LABEL: now + 60}, False), "seen again a minute later: no write")
+        merged, write = hook.merge_observed_labels({self.LABEL: now}, frozenset({self.LABEL}),
+                                                   now + hook.OBSERVED_LABEL_REFRESH_S)
+        self.assertTrue(write, "past the refresh the stamp is written, so the TTL measures the last sighting")
+        kept, write = hook.merge_observed_labels({f"l{i}": now - i for i in range(hook.OBSERVED_LABEL_MAX + 4)},
+                                                 frozenset(), now)
+        self.assertEqual(len(kept), hook.OBSERVED_LABEL_MAX, "the file stays bounded whatever the feed says")
+        self.assertTrue(write)
+        self.assertNotIn(f"l{hook.OBSERVED_LABEL_MAX + 3}", kept, "the least recently dispatched goes first")
+        self.assertEqual(hook.merge_observed_labels({self.LABEL: now}, frozenset(), now)[1], False,
+                         "a look that saw nothing writes nothing")
 
     def test_a_receipt_it_cannot_read_is_not_published_as_a_disagreement(self) -> None:
         # With no readable receipt there is nothing for the dispatches to disagree with. Reporting drift here would

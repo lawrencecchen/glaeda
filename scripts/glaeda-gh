@@ -26583,6 +26583,185 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     return fixed, []
 
 
+def positional_capacity(p: argparse.ArgumentParser) -> float:
+    """How many positional words P can hold: 1 per plain or optional positional, unbounded for one that
+    takes a list or nests a subparser (everything after it is that command's). A call with more positional
+    words than this cannot parse, which is what tells an extra word from data that merely looks like one."""
+    total = 0.0
+    for action in p._actions:  # noqa: SLF001  argparse has no public reader for this
+        if action.option_strings:
+            continue
+        if isinstance(action, argparse._SubParsersAction) or action.nargs in ("*", "+", argparse.REMAINDER):  # noqa: SLF001
+            return math.inf
+        total += 1
+    return total
+
+
+def spelled_long_flag(word: str, options: dict[str, bool]) -> str | None:
+    """WORD as one of OPTIONS' long flags, however this tool would come to read it: canonical, in another of
+    its case conventions (`--statusKey` is `--status-key`, what `flag_spelling_synonym` makes of it), or an
+    abbreviation (argparse's `allow_abbrev` is on, so `--contain` is `--contains` and `--time` is
+    `--timeout`). None when it is no long flag of this command, or a spelling several of them answer to,
+    which this tool and argparse both refuse themselves.
+
+    Every reader of a flag's name goes through here, so a flag's value is read as its value in each
+    spelling the call would be accepted in: a spelling only one reader knows made a call that parses look
+    like a call with one positional word too many (re-review of #2381)."""
+    if not word.startswith("--") or word in ("--", "---"):
+        return None
+    if word in options:
+        return word
+    key = normalized_flag(word)
+    spellings = [option for option in options if normalized_flag(option) == key]
+    if spellings:
+        return spellings[0] if len(spellings) == 1 else None
+    hits = [option for option in options if option.startswith(word)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def positional_words(raw: list[str]) -> list[tuple[int, str]]:
+    """(index, word) for every word of RAW[1:] that is a positional: no flag, and no flag's value. Stops at a
+    bare `--`, past which nothing is this tool's own.
+
+    A flag's value counts for nothing even where the flag is abbreviated (`--contain x`), or the call this
+    reads as one word too deep is one argparse accepts (review of #2381, F3)."""
+    options = flag_options(raw)
+    out: list[tuple[int, str]] = []
+    i = 1
+    while i < len(raw):
+        word = raw[i]
+        if word == "--":
+            break
+        if word.startswith("-") and word != "-":
+            name = word.split("=", 1)[0]
+            takes_value = options.get(spelled_long_flag(name, options) or name)
+            i += 2 if takes_value and "=" not in word else 1
+            continue
+        out.append((i, word))
+        i += 1
+    return out
+
+
+def kind_scoped_options(p: argparse.ArgumentParser, kinds: list[str]) -> dict[str, frozenset[str]]:
+    """Each long option of P whose own help text scopes it to some of KINDS: `--title`'s `pr: the title`,
+    `--status-key`'s `comment: ...`, `--gate`'s `comment or review: ...`.
+
+    A command whose words are one positional's `choices` has a single parser, so every one of its words
+    takes every one of its options as far as argparse is concerned; the scope that really holds is written
+    in the help, next to the option, which is where this reads it so the two cannot drift. Only a help text
+    that *begins* with words that are all KINDS counts, so `--body`'s `the text (prefer --body-file: ...)`
+    scopes nothing and answers for every kind."""
+    out: dict[str, frozenset[str]] = {}
+    for action in p._actions:  # noqa: SLF001
+        lead, found, _ = (action.help or "").partition(":")
+        if not found:
+            continue
+        # A help text names a kind in whatever number and case reads well there -- `wait`'s own options say
+        # `comments:`, `runs:` and `PRs:` -- and that is still the kind it scopes to (review of #2381, F5:
+        # before this, only `--exists`, `--gone` and `--contains` ever narrowed a `wait` call).
+        spelled = {kind.lower().rstrip("s"): kind for kind in kinds}
+        named = [spelled.get(word.lower().rstrip("s")) for word in re.split(r",\s*|\s+or\s+|\s+", lead.strip())
+                 if word]
+        if named and all(named):
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    out[option] = frozenset(word for word in named if word is not None)
+    return out
+
+
+def doubled_kind_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """Two of one command's own first-slot words in a row, as `glaeda-gh post pr comment o/r#1`: the extra
+    word is named, not guessed away: (argv, refusal lines).
+
+    Measured 2026-11-21, that call answered `unrecognized arguments: manaflow-ai/cmuxterm-hq#17050` -- it
+    named the one part of the call that was right, so the next try edited the target instead of dropping
+    `pr`, and the receipt it was posting waited another round trip. Both `pr` and `comment` are words
+    `post` takes and either reading runs, so which was meant decides what gets posted and where: it is
+    refused and both readings are printed as lines that run, the way an ambiguous word is in
+    `nesting_synonym`. The one narrowing is the same evidence that one uses -- the caller's own flags --
+    read here off the help text that scopes each option to a kind (`kind_scoped_options`), because a
+    command whose words are one positional's `choices` has one parser and so one set of options. That
+    narrowing answers the measured call: `--gate` is `comment or review`'s, and of `pr` and `comment` only
+    `comment` is left.
+
+    Only a call that cannot parse anyway is touched: with more positional words than the command has room
+    for. So `glaeda-gh search prs both`, whose `both` is a word of `search` but also this caller's query,
+    is left exactly as typed, because `search` holds it."""
+    if len(raw) < 3 or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    tops, _ = nesting_table()
+    if raw[0] not in tops:
+        return raw, []  # not a command: `nesting_synonym` above has already had its say
+    node = child_parser(parser(), raw[0])
+    words = first_slot_words(node)
+    found = positional_words(raw)
+    if len(found) < 2 or len(found) <= positional_capacity(node):
+        return raw, []
+    (first, one), (second, two) = found[0], found[1]
+    if one not in words or two not in words:
+        return raw, []
+    without_second = [w for i, w in enumerate(raw) if i != second]
+    if one == two:
+        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + without_second)}` (`{one}` is one word of "
+              f"`{raw[0]}`, typed twice)", file=sys.stderr)
+        return without_second, []
+    readings = {one: without_second, two: [w for i, w in enumerate(raw) if i != first]}
+    by_option = kind_scoped_options(node, words)
+    scoped = {normalized_flag(option): scope for option, scope in by_option.items()}
+    options = flag_options(raw)
+    narrowed: set[str] = set(readings)
+    evidence: list[str] = []
+    for word in raw[1:]:
+        if word == "--":
+            break
+        if not word.startswith("--"):
+            continue  # a flag's value, a target, a body: data, never evidence (review of #2381, F1)
+        name = word.split("=", 1)[0]
+        scope = scoped.get(normalized_flag(name)) or scoped.get(
+            normalized_flag(spelled_long_flag(name, options) or name))
+        if scope is not None and not narrowed <= scope:
+            narrowed &= scope
+            evidence.append(f"`{name}` is {' or '.join(sorted(scope))}'s")
+    if len(narrowed) == 1:
+        kept = next(iter(narrowed))
+        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + readings[kept])}` (`{one} {two}` is two words "
+              f"of `{raw[0]}`, and {'; '.join(evidence)})", file=sys.stderr)
+        return readings[kept], []
+    told = f", and the flags typed scope to neither: {'; '.join(evidence)}" if not narrowed else ""
+    refusal = [f"glaeda-gh: `{one} {two}` is two words of `{raw[0]}`, which takes one: `{raw[0]} {one}` and "
+               f"`{raw[0]} {two}` are both calls that run and they do not do the same thing, so neither "
+               f"word is dropped for you{told}"]
+    refusal += [f"next: {' '.join(['glaeda-gh'] + own_kinds_flags(reading, kind, by_option, options))}"
+                for kind, reading in readings.items()]
+    return raw, refusal
+
+
+def own_kinds_flags(argv: list[str], kind: str, by_option: dict[str, frozenset[str]],
+                    options: dict[str, bool]) -> list[str]:
+    """ARGV without the flags whose own help scopes them away from KIND, each with its value.
+
+    A `next:` line is printed to be run, so it carries only what its own reading takes: `post pr comment
+    o/r#1 --title t --status-key k` offers `post pr o/r#1 --title t`, not a call `post_item` refuses for
+    `--status-key` (review of #2381, F4)."""
+    scoped = {normalized_flag(option): scope for option, scope in by_option.items()}
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        word = argv[i]
+        if word == "--":
+            out.extend(argv[i:])
+            break
+        name = word.split("=", 1)[0]
+        spelled = spelled_long_flag(name, options) or name
+        scope = scoped.get(normalized_flag(name)) or scoped.get(normalized_flag(spelled))
+        if word.startswith("--") and scope is not None and kind not in scope:
+            i += 2 if options.get(spelled) and "=" not in word else 1
+            continue
+        out.append(word)
+        i += 1
+    return out
+
+
 def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """A long flag typed in another of its own case conventions, as this tool spells it: (argv, refusal lines).
 
@@ -26663,8 +26842,10 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (nesting_synonym, flag_spelling_synonym):
+    for rewriter in (nesting_synonym, doubled_kind_synonym, flag_spelling_synonym):
         # The nesting first, then the flags: which options a command has depends on which command it is.
+        # `doubled_kind_synonym` sits between them: it only looks at a call that already leads with a real
+        # command, which is what `nesting_synonym` has just made sure of, and it reads flags only by name.
         raw, refusal = rewriter(raw)
         if refusal:
             for line in refusal:

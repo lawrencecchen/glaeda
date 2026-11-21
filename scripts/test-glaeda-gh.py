@@ -4853,7 +4853,7 @@ class ClientTest(Base):
     def test_land_takes_a_head_pin_and_slash_targets(self) -> None:
         """Coordinator, 2026-11-21: `land manaflow-ai/cmux/48704 --match-head-commit SHA` was "unrecognized arguments"."""
         args = gg.parser().parse_args(["land", "manaflow-ai/cmux/48704", "--match-head-commit", "abc1234"])
-        self.assertEqual((args.words, args.match_head), (["manaflow-ai/cmux/48704"], "abc1234"))
+        self.assertEqual((args.words, args.sha), (["manaflow-ai/cmux/48704"], "abc1234"))
         self.assertEqual(gg.land_key("manaflow-ai/cmux/48704")[1:], ("manaflow-ai/cmux", 48704))
         head = "a" * 40
         with mock.patch.object(gg, "pr_head_sha", lambda repo, n: head):
@@ -21775,6 +21775,39 @@ class LandTest(Base):
         self.tick(30)
         self.assert_merged_at(LA)
 
+    def test_sha_pins_the_land_to_that_head(self):
+        # `glaeda-gh land o/r#1 --sha SHA` (an agent typed it, 2026-11-21, and argparse refused it): the head it names
+        # merges; another head stops the land (head_moved) before land_judge or a merge, naming the land again.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA[:12])
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_sha_pin_stops_when_the_head_is_another(self):
+        self.pr(LB)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.explains(), self.w.gh_calls("pr", "merge")),
+                         ("stopped", "head_moved", [], []))
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
+        self.assertIn("stopped: head_moved", self.w.sent()[-1][-1])
+        # A land again without --sha drops the pin: it lands the head judged, as before.
+        self.land()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertNotIn("pinSha", e)
+        self.assert_merged_at(LB)
+
+    def test_land_takes_timeout_as_wait_and_a_sha(self):
+        args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
+        self.assertEqual((args.wait, args.sha), (1400, LA))
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1", "--wait", "5"]).wait, 5)
+        self.assertEqual(gg.land_pin_sha(LA.upper()), LA)
+        with self.assertRaises(gg.WatchError):
+            gg.land_pin_sha("not-a-sha")
+        self.assertEqual(gg.land_serve_one({"op": "land", "target": "o/r#1", "sha": "zz"})[0], None)
+
     def test_dependency_chain_lands_after_the_first_merges(self):
         self.pr(LA)
         self.pr(LC, key="pr:o/r#2")
@@ -23010,6 +23043,87 @@ class LandTest(Base):
         self.assertEqual((call[3], json.loads(call[4])), ("o/r", {"number": 1, "sha": LA}))
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
         self.assertEqual((e["state"], len(self.w.explains())), ("merged", 1))
+
+    OVERRIDE = {"reason": "base red: ci fails the same way on main", "receipt": "main run 123 job 456"}
+
+    def merge_envs(self) -> list[dict]:
+        return [env for c, env in zip(self.w.calls, self.w.envs)
+                if c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"]]
+
+    def test_land_override_rides_every_merge_try_and_is_logged_with_the_entry(self):
+        # lw#7078 stopped in the queue on a base red, and cmux#48755 landed by hand: glaeda land carried no override.
+        # `land --override-reason R --override-receipt T`: every merge try runs with LAND_JUDGE_OVERRIDE(_RECEIPT).
+        want = {"LAND_JUDGE_OVERRIDE": self.OVERRIDE["reason"], "LAND_JUDGE_OVERRIDE_RECEIPT": self.OVERRIDE["receipt"]}
+        self.pr(LA)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane"}), \
+                mock.patch.object(gg, "policy_host", return_value="host"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.main(["land", "o/r#1", "--override-reason", self.OVERRIDE["reason"],
+                                      "--override-receipt", self.OVERRIDE["receipt"], "--json"]), 0)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "merge refused: something transient"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(e.get("override"), self.OVERRIDE)
+        queued = [h for h in e["history"] if h["event"] == "queued"]
+        self.assertEqual((queued[-1].get("override"), queued[-1].get("receipt")),
+                         (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
+        self.assertIn("override: " + self.OVERRIDE["reason"], gg.land_line(e, self.t))
+        self.w.gh_rc["merge"] = 0
+        for _ in range(20):
+            if e.get("state") == "merged":
+                break
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(600)
+        self.assertEqual(e.get("state"), "merged")
+        envs = self.merge_envs()
+        self.assertGreaterEqual(len(envs), 2)
+        for env in envs:
+            self.assertEqual({k: env.get(k) for k in want}, want)
+        # with none given, a merge carries none
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.assertEqual(self.tick()["state"], "merged")
+        [env] = self.merge_envs()
+        self.assertFalse(set(want) & set(env))
+
+    def test_land_override_goes_to_the_brokers_land_as_its_override(self):
+        self.broker = True
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        [call] = self.broker_lands()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "override": self.OVERRIDE})
+        [env] = self.merge_envs()
+        self.assertEqual((env.get("LAND_JUDGE_OVERRIDE"), env.get("LAND_JUDGE_OVERRIDE_RECEIPT")),
+                         (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
+        self.assertEqual(e["state"], "merged")
+
+    def test_land_override_past_lane_gh_lands_limits_is_refused_at_enqueue(self):
+        bad = [["--override-reason", "r"], ["--override-receipt", "t"],
+               ["--override-reason", "r" * 201, "--override-receipt", "t"],
+               ["--override-reason", "r", "--override-receipt", "t" * 241],
+               ["--override-reason", "two\nlines", "--override-receipt", "t"],
+               ["--override-reason", "r", "--override-receipt", "two\nlines"]]
+        for extra in bad:
+            said: list[str] = []
+            with self.subTest(extra=[w[:12] for w in extra]), \
+                    mock.patch.object(gg, "daemon_running", return_value=True), \
+                    mock.patch.object(gg, "say_waiting", said.append), contextlib.redirect_stdout(io.StringIO()):
+                self.assertNotEqual(gg.main(["land", "o/r#1", *extra]), 0)
+                self.assertRegex(" ".join(said), r"override-re(ason|ceipt)")
+                d = gg.LandQueue.requests_dir()
+                self.assertEqual(list(d.glob("*.json")) if d.is_dir() else [], [], "nothing queued")
+        # the limits themselves are allowed
+        self.assertEqual(gg.land_override("r" * 200, "t" * 240), {"reason": "r" * 200, "receipt": "t" * 240})
+        # a forwarded request past them carries no override into the queue
+        self.assertIsNone(gg.land_request_override({"override": {"reason": "r" * 201, "receipt": "t"}}))
 
     def test_a_lane_vms_merge_the_broker_refused_on_a_spent_login_is_parked_until_its_reset(self):
         self.broker = True

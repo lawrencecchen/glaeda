@@ -360,6 +360,12 @@ def load_manifest(path: Path, text: str | None = None) -> dict[str, Any]:
             raise Failure(f"{path}: host name {name!r} is not usable as an SSH destination")
         if host_key(name) in never or host_key(host.get("hostname") or "") in never:
             raise Failure(f"{path}: host {name} is also in never_touch")
+        alias = host.get("alias")
+        if alias is not None:
+            if not isinstance(alias, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", alias):
+                raise Failure(f"{path}: host {name} alias {alias!r} must be lowercase letters, digits and hyphens")
+            if host_key(alias) in never:
+                raise Failure(f"{path}: host {name} alias {alias!r} is in never_touch")
         unknown = set(host.get("roles", [])) - set(ROLES)
         if unknown:
             raise Failure(f"{path}: host {name} has unknown roles {sorted(unknown)}; known: {', '.join(ROLES)}")
@@ -395,6 +401,14 @@ def load_manifest(path: Path, text: str | None = None) -> dict[str, Any]:
                 host_policy(data, name)["authorized_keys"].get("allow", []):
             if key_id not in data["keys"]:
                 raise Failure(f"{path}: host {name} names unknown key {key_id!r}")
+    seen: dict[str, str] = {}
+    for name, host in data["hosts"].items():
+        for label in (name, host.get("alias")):
+            if label is None:
+                continue
+            if host_key(label) in seen and seen[host_key(label)] != name:
+                raise Failure(f"{path}: {label!r} names both {seen[host_key(label)]} and {name}")
+            seen[host_key(label)] = name
     writers = [n for n, h in data["hosts"].items() if CATCH_UP_WRITER in h.get("roles", [])]
     if len(writers) > 1:
         raise Failure(f"{path}: hosts {', '.join(writers)} are all {CATCH_UP_WRITER}; the fleet has one writer")
@@ -823,12 +837,16 @@ def select_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> list[str
     if not wanted:
         return names
     never = {host_key(n) for n in manifest.get("never_touch", [])}
+    aliases = {host_key(h["alias"]): n for n, h in manifest["hosts"].items() if h.get("alias")}
+    resolved = set()
     for name in wanted:
         if host_key(name) in never:
             raise Failure(f"{name} is in never_touch; this tool does not connect to it")
+        name = aliases.get(host_key(name), name)
         if name not in manifest["hosts"]:
             raise Failure(f"{name} is not in the manifest")
-    return [n for n in names if n in wanted]
+        resolved.add(name)
+    return [n for n in names if n in resolved]
 
 
 # ---------------------------------------------------------------- observe

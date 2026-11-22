@@ -3713,6 +3713,53 @@ class BalanceTest(Base):
         self.assertNotIn("checksPageError", data)
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
+    def red_page(self, number: int, red_at: int) -> list[dict]:
+        """150 contexts, none required, the rollup FAILURE from one red status at RED_AT, its counts over every page."""
+        checks: list[dict] = [workflow_check(f"job-{i}", 5) for i in range(149)]
+        checks.insert(red_at, status_context("deploy/preview", "FAILURE"))
+        first = pr_node(number, rollup="FAILURE", checks=checks[:100])
+        contexts = first["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+        contexts.update(totalCount=len(checks), pageInfo={"hasNextPage": True, "endCursor": "100"},
+                        checkRunCountsByState=[{"state": "SUCCESS", "count": 149}],
+                        statusContextCountsByState=[{"state": "FAILURE", "count": 1}])
+        first["baseRef"] = {"branchProtectionRule": None, "rules": {"nodes": []}}
+        self.gh.prs[("o", "r", number)] = first
+        self.gh.heads[("o", "r", "a" * 40)] = checks
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        return checks
+
+    def test_a_red_rollup_whose_red_is_past_the_first_page_is_paged_and_named(self) -> None:
+        """A cmux PR, 2026-11-22: the first page's checks all passed, GitHub's rollup was FAILURE, and a wait ended
+        "0 check(s) failed" with a next step pointing at a list it never printed. The counts say a red sits past the
+        page, so the read pages on (a base that requires nothing included) and the verdict names it."""
+        self.red_page(12, red_at=130)
+        gg.register("pr:o/r#12")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#12")["data"]
+        self.assertEqual(len(data["checks"]), 150)
+        self.assertNotIn("checksPageError", data)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.assertEqual(gg.verdict("pr", data, "done"), gg.EXIT_FAIL)
+        self.assertEqual([c["name"] for c in gg.classify(data, NOW, gg.RESCUE_GRACE)["failed"]], ["deploy/preview"])
+
+    def test_a_red_rollup_whose_red_is_on_the_first_page_is_not_paged(self) -> None:
+        self.red_page(13, red_at=40)
+        gg.register("pr:o/r#13")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#13")["data"]
+        self.assertEqual(len(data["checks"]), 100)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+
+    def test_a_truncated_red_with_no_failed_check_read_names_no_list_above(self) -> None:
+        """When a red past the pages read is still unnamed (pages held, an older cache), the wait says the rollup's
+        red sits past the checks read and sends to status, not to "the failed checks listed above"."""
+        data = {**gg.parse_pr(pr_node(14, rollup="FAILURE", checks=[check_run("a")])), "checksTruncated": True}
+        req = {"key": "pr:o/r#14", "kind": "pr", "until": "done", "sha": "a" * 40, "timeout": 5, "began": time.time()}
+        out = gg.wait_outcome(req, gg.EXIT_FAIL, {"data": data}, 5)
+        self.assertNotIn("listed above", out["next"])
+        self.assertIn("glaeda-gh status pr o/r#14", out["next"])
+        self.assertIn("past the 1 checks read", out["reason"])
+
     def test_status_pr_check_pages_stop_at_their_hourly_share(self) -> None:
         """Past PR_PAGES_POINTS_PER_HOUR the follow-up pages stop, and the PR reads pending, never green."""
         checks = [workflow_check(f"job-{i}", 5) for i in range(150)]
@@ -21150,6 +21197,7 @@ class StaleDataTest(Base):
         self.assertEqual(code, gg.EXIT_OK, said.getvalue() + out.getvalue())
         self.assertIn("WARNING: the daemon has not refreshed o/r#9", said.getvalue())
         self.assertIn("direct read answered", said.getvalue())
+        self.assertNotIn("glaeda-gh restart", said.getvalue())  # a read that answered needs no restart
         self.assertIn("MERGED", out.getvalue())
         self.assertEqual(len(self.gh.gql_calls()), 1, "one direct read, not a loop")
 
@@ -29052,6 +29100,44 @@ class LandTest(Base):
         self.w.cache[self.KEY]["dataAt"] = self.t - 5
         e["refresh"] = {}
         self.assertFalse(self.q.refresh_due(e, self.w.cache[self.KEY]))  # a fresh copy: no read
+
+    def test_a_due_entry_on_a_host_with_its_own_login_reads_a_stale_copy_itself(self):
+        """2026-11-22 01:00Z: a PR green and requested pinned three times sat on a copy 81 then 117 min old
+        on a host with its own login (the nudge only marked it waited in a pass hours behind), so every judgment
+        was "unreadable". A copy older than LAND_OWN_REFRESH_AFTER and read before the land request is read directly, a
+        re-request of the open entry at the head the copy shows included, before it is judged."""
+        self.fresh_head = LB
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 7020
+        self.land()
+        e = self.tick()
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.assertEqual(self.w.explains(), [])  # not judged on the stale copy
+        self.assertIsNone(e["refresh"]["error"])
+        self.w.answers.append(ok_answer(LB))
+        self.tick()
+        self.assert_merged_at(LB)  # the head the fresh read showed
+        self.assertEqual(self.w.refreshed, [self.KEY])
+
+    def test_own_login_refreshes_follow_a_land_request_only_paced_and_capped(self):
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 3600
+        c = self.w.cache[self.KEY]
+        e = {"key": self.KEY, "state": "waiting", "wait": {"kind": "pr"}, "wakeAt": self.t - 1}
+        self.assertFalse(self.q.refresh_due(e, c))  # no land request: the daemon's pass reads it
+        e["requestedAt"] = c["dataAt"] - 1
+        self.assertFalse(self.q.refresh_due(e, c))  # read since the request
+        e["requestedAt"] = c["dataAt"] + gg.LAND_OWN_REFRESH_AFTER - 1
+        self.assertFalse(self.q.refresh_due(e, c))  # the copy was fresh enough when asked: aged since, not stale then
+        e["requestedAt"] = self.t
+        e["refresh"] = {"at": self.t - gg.LAND_OWN_REFRESH_AFTER + 1}
+        self.assertFalse(self.q.refresh_due(e, c))  # read this recently already
+        e["refresh"] = {}
+        self.q.own_refreshed = [self.t - 1] * gg.LAND_OWN_REFRESH_MAX
+        self.assertFalse(self.q.refresh_due(e, c))  # the host's hourly cap
+        self.q.own_refreshed = [self.t - gg.LAND_WINDOW_S - 1] * gg.LAND_OWN_REFRESH_MAX
+        self.assertTrue(self.q.refresh_due(e, c))
+        self.assertEqual(len(self.q.own_refreshed), 1)
 
     def test_a_stale_land_judge_checkout_warns_once_and_clears(self):
         """gcp-codex-lane-12, 2026-11-17: a lane VM's leo-workspace sat at #5512 and its land_judge refused every merge

@@ -22721,7 +22721,8 @@ class LandTest(Base):
         self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
         self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
-        self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
+        self.assertEqual(self.w.sent()[-1][4:12], ["--notice", "--severity", "info", "--sender", "glaeda-land",
+                                                   "--class", "block", "--title"])
 
     def test_land_notify_always_passes_prompt_after_notice_options(self):
         self.pr(LA)
@@ -22731,6 +22732,17 @@ class LandTest(Base):
         sent = self.w.sent()[-1]
         message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
         self.assertEqual(sent[-2:], [message, message])
+
+    def test_a_land_notice_that_is_sent_wakes_as_a_block(self):
+        # What a land sends is what its requester acts on (merged, stopped), so it wakes an idle lane at once; an
+        # unclassified notice is an FYI that waits for the inbox's 15-minute flush.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        sent = self.w.sent()[-1]
+        self.assertEqual(sent[sent.index("--class") + 1], "block")
+        self.assertIn("merged", sent[-1])
 
     def test_land_notify_uses_parent_session_from_queued_reader(self):
         self.pr(LA)
@@ -24356,17 +24368,23 @@ class LandTest(Base):
         self.land("o/r#2", after=["o/r#3"], requester="host/two")
         self.land("o/r#1", after=["o/r#2"], requester="host/one")
         self.w.answers.append(numbered(refusal("block", LC, {"kind": "stop", "stop": "block", "why": "BLOCK"}), 3))
-        self.tick()
-        self.tick()
+        logged: list[dict] = []
+        with mock.patch.object(gg, "log", logged.append):
+            self.tick()
+            self.tick()
         es = self.q.entries
         self.assertEqual([es[f"pr:o/r#{n}"]["state"] for n in (3, 2, 1)], ["stopped", "waiting_after", "waiting_after"])
+        # #3's requester is woken by its stop; #2's wait behind it is a log line, never a wake (LandQueue.notify)
         told = {m[3]: m[-1] for m in self.w.sent()}
-        self.assertIn("o/r#3, which it lands after, stopped (block)", told["host/two"])
-        self.assertIn("next: glaeda-gh land o/r#3", told["host/two"])
-        self.assertNotIn("host/one", told)  # #1 waits on #2, which is still queued
+        self.assertEqual(list(told), ["host/three"])
+        quiet = {d["to"]: d["message"] for d in logged if d.get("event") == "land-notice-quiet"}
+        self.assertIn("o/r#3, which it lands after, stopped (block)", quiet["host/two"])
+        self.assertIn("next: glaeda-gh land o/r#3", quiet["host/two"])
+        self.assertNotIn("host/one", quiet)  # #1 waits on #2, which is still queued
+        self.assertIn("after_stopped_waiting", [h.get("event") for h in es["pr:o/r#2"]["history"]])
         for _ in range(5):
             self.tick(600)
-        self.assertEqual(len(self.w.sent()), 2)  # told once, never again while #3 stays stopped
+        self.assertEqual(len(self.w.sent()), 1)  # #3's stop, told once
         # #3 is fixed and landed again: the chain lands in order (one judged at a time, so answers in chain order)
         self.w.answers += [numbered(ok_answer(LC), 3), numbered(ok_answer(LB), 2), numbered(ok_answer(LA), 1)]
         self.land("o/r#3", requester="host/three")
@@ -24847,9 +24865,14 @@ class LandTest(Base):
         self.land("o/r#2", requester="host/two")
         self.land(after=["o/r#2"], requester="host/one")
         self.stop_o_r_2("BLOCK one")
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
         self.tick()
         self.tick(600)
-        to_one = lambda: [m for m in self.w.sent() if m[3] == "host/one"]
+        self.assertFalse([m for m in self.w.sent() if m[3] == "host/one"])  # a wait behind a stop wakes no one
+        to_one = lambda: [d for d in logs if d.get("event") == "land-notice-quiet" and d["to"] == "host/one"]
         self.assertEqual(len(to_one()), 1)
         self.stop_o_r_2("BLOCK two")  # landed again, and stopped again: a new stop
         self.land("o/r#2", requester="host/two")
@@ -25559,7 +25582,8 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
         self.assertEqual(e["handedOff"]["head"], LA)
         self.assertTrue(any(h.get("event") == "handed_off" for h in e["history"]), e["history"])
-        self.assertTrue(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
+        # handed off is no wake: the requester hears from huge-blue's queue when it merges or stops
+        self.assertFalse(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
         # nothing more here: no judgment, no step, no second hand-off
         for _ in range(5):
             self.tick(600)
@@ -26081,12 +26105,15 @@ class LandTest(Base):
                 with mock.patch.object(gg, "policy_host", lambda: "host"):
                     self.land(requester="host/lane")
                     self.w.answers.append(refusal(code, LA, {"kind": "retry"}, reason=self.UNREAD))
-                    e = self.tick()
+                    logged: list[dict] = []
+                    with mock.patch.object(gg, "log", logged.append):
+                        e = self.tick()
                 [call] = self.handoffs()
                 self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
                 self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
-                said = [c[-1] for c in self.w.sent() if "handed to huge-blue" in c[-1]]
-                self.assertTrue(said and "could not judge it" in said[0], self.w.sent())
+                self.assertFalse([c for c in self.w.sent() if "handed to huge-blue" in c[-1]], self.w.sent())
+                said = [d["message"] for d in logged if d.get("event") == "land-notice-quiet"]
+                self.assertTrue(said and "handed to huge-blue" in said[0] and "could not judge it" in said[0], logged)
                 for _ in range(3):
                     self.tick(600)
                 self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
@@ -28031,13 +28058,15 @@ class LandTest(Base):
         self.tick(30)
         self.assertEqual(self.w.explains(), [])
         self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [2, 2, 2])
-        sent = self.w.sent()
-        self.assertEqual(sorted(s[3] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
-        # The notice quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
+        # "nothing to do" is a log line, never a wake (LandQueue.notify)
+        self.assertEqual(self.w.sent(), [])
+        sent = [(d["to"], d["message"]) for d in logs if d.get("event") == "land-notice-quiet"]
+        self.assertEqual(sorted(s[0] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
+        # The line quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
         self.assertTrue(all("latch" in s[-1] and "no latch-free check on this host" in s[-1]
                             and "leo-workspace#5944" not in s[-1] for s in sent), sent)
         self.tick(60)
-        self.assertEqual(len(self.w.sent()), 3, "told once")
+        self.assertEqual(len([d for d in logs if d.get("event") == "land-notice-quiet"]), 3, "said once")
         # The next clear: at once, past no spread, oldest wake first
         self.retries(3)
         self.tick(reset2 + 1 - self.t)

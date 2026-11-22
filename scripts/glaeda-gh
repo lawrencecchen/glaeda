@@ -12148,6 +12148,26 @@ LAND_WINDOW_S = 3600.0
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
 # history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
 LAND_DUE_LATE = 1800.0
+# A job (a judgment, a merge or other step, a PR read) that has held its worker this long is logged once
+# ("land-slot-held"), named in the land-pool line ("slotHeld": the one holding longest) and in its status line, so a
+# slot held past it is seen where it is held, not only as a due count growing behind it. A lane VM,
+# 2026-11-22 03:29-04:06Z: three PRs held 3 of the 4 workers between them, each judged "unreadable" again and
+# again at an unmoved head, while 27 lands sat "due since" 22:00Z-02:46Z.
+LAND_SLOT_HELD = 1800.0
+# At most this share of the workers (rounded down, at least one) may judge an entry again whose last answer judged
+# nothing at the head the cache still shows (LAND_UNREAD_CODES: a read could not complete): such a re-read learns
+# nothing new while the reads it waits on still fail, and holds its worker the whole wait (4-10 min a judgment that
+# night). Such entries also sort behind every other due entry (judge_order), so the rest of the workers go to lands
+# that can move. A re-read past the share waits for one of them to end (gated, "re-reads hold their share").
+LAND_REREAD_SHARE = 0.5
+# The bound on one entry's hold: an entry whose jobs held workers LAND_HOLD_MAX in total within one LAND_HOLD_WINDOW
+# (counted from its first job in the window), and whose last answer still judged nothing (LAND_NOT_JUDGED), takes no
+# worker again until that window ends. Each judgment is bounded on its own (LAND_EXPLAIN_DEADLINE), but a slow read
+# answered "unreadable" then a 2-minute retry gave the same entry its worker back over and over: one PR held a worker
+# for 45 of 60 min that night and for hours in all. Logged once per window ("land-hold-capped"), and named in its
+# history and status line. A judgment that judges something (any other code) is never held by it.
+LAND_HOLD_MAX = 1200.0
+LAND_HOLD_WINDOW = 3600.0
 LAND_TEXT = 400  # a reason or step kept in an entry or a message, at most
 LAND_STOP_CLASSES = {"block": "block", "held": "hold", "chat_hold": "chat_hold", "classic_frozen": "classic_frozen",
                      "language_boundary": "language_boundary", "react_port": "react_port", "teammate": "teammate",
@@ -13092,6 +13112,8 @@ class LandQueue:
         self.local = threading.local()  # .gen: the request generation the worker's job started under
         self.entries: dict[str, dict] = {}
         self.jobs: dict[str, Any] = {}
+        self.job_started: dict[str, tuple[float, str]] = {}  # key: (when its job took a worker, the job's name)
+        self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
         self.pass_load_gated = 0  # ... of them, those the host's measured load held back (load_room)
@@ -13960,6 +13982,13 @@ class LandQueue:
         for key, fut in list(self.jobs.items()):
             if fut is None or fut.done():
                 del self.jobs[key]
+                started = self.job_started.pop(key, None)
+                if started is not None:
+                    self.count_hold(key, started[0])
+                if key in self.slot_held_logged:
+                    self.slot_held_logged.discard(key)
+                    log({"event": "land-slot-freed", "key": key, "job": started[1] if started else None,
+                         "heldS": round(self.now - started[0]) if started else None})
                 err = fut.exception() if fut is not None else None
                 if err is not None:
                     log({"event": "land-error", "key": key, "error": describe(err), "site": error_site(err)})
@@ -13970,6 +13999,74 @@ class LandQueue:
                             e["wait"] = {"kind": "retry"}
                             self.history(e, "error", error=describe(err))
                             self.save(e)
+        for key, (at, job) in list(self.job_started.items()):
+            if key in self.jobs and key not in self.slot_held_logged and self.now - at >= LAND_SLOT_HELD:
+                self.slot_held_logged.add(key)
+                state = (self.entries.get(key) or {}).get("state")
+                log({"event": "land-slot-held", "key": key, "job": job, "state": state, "heldS": round(self.now - at),
+                     "workers": self.workers(), "busy": len(self.jobs)})
+
+    def slot_held(self) -> dict | None:
+        """The job holding its worker longest (the land-pool line's "slotHeld"), or None while no job runs."""
+        live = [(at, key, job) for key, (at, job) in self.job_started.items() if key in self.jobs]
+        if not live:
+            return None
+        at, key, job = min(live)
+        return {"pr": key_name(key), "job": job, "heldS": int(self.now - at)}
+
+    def count_hold(self, key: str, started: float) -> None:
+        """Adds a finished job's time on its worker to its entry's holdWindow (LAND_HOLD_MAX)."""
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None:
+                return
+            w = e.get("holdWindow") or {}
+            if not isinstance(w.get("since"), (int, float)) or self.now - float(w["since"]) >= LAND_HOLD_WINDOW:
+                w = {"since": started, "heldS": 0.0}
+            w["heldS"] = round(float(w.get("heldS") or 0.0) + max(0.0, self.now - started), 1)
+            e["holdWindow"] = w
+            self.save(e)
+
+    def hold_spent(self, e: dict) -> bool:
+        """True while E has held workers LAND_HOLD_MAX within its LAND_HOLD_WINDOW and its last answer judged nothing:
+        it waits for the window to end (logged once per window, land-hold-capped)."""
+        w = e.get("holdWindow") or {}
+        since = w.get("since")
+        if not isinstance(since, (int, float)) or self.now - float(since) >= LAND_HOLD_WINDOW:
+            return False
+        if float(w.get("heldS") or 0.0) < LAND_HOLD_MAX:
+            return False
+        if str((e.get("explain") or {}).get("code") or "") not in LAND_NOT_JUDGED:
+            return False
+        if not w.get("capped"):
+            w["capped"] = self.now
+            until = float(since) + LAND_HOLD_WINDOW
+            self.history(e, "hold_capped", heldS=round(float(w["heldS"])), until=utc_clock(until))
+            log({"event": "land-hold-capped", "key": e["key"], "heldS": round(float(w["heldS"])),
+                 "windowS": LAND_HOLD_WINDOW, "until": utc_clock(until),
+                 "code": (e.get("explain") or {}).get("code")})
+            self.save(e)
+        return True
+
+    def reread(self, e: dict) -> bool:
+        """True when E's last answer judged nothing (LAND_UNREAD_CODES) at the head the cache still shows: judging it
+        again waits on the same failing reads (LAND_REREAD_SHARE)."""
+        x = e.get("explain") or {}
+        if str(x.get("code") or "") not in LAND_UNREAD_CODES:
+            return False
+        head = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
+        was = str(x.get("head") or (e.get("unreadRun") or {}).get("head") or "").lower()
+        return not head or not was or head == was
+
+    def reread_room(self, e: dict) -> bool:
+        """Whether E may start a judgment under LAND_REREAD_SHARE: always unless it is a re-read (reread) and that
+        share of the workers already judges re-reads."""
+        if not self.reread(e):
+            return True
+        share = max(1, int(self.workers() * LAND_REREAD_SHARE))
+        busy = sum(1 for k in self.jobs if (self.entries.get(k) or {}).get("state") == "judging"
+                   and self.reread(self.entries[k]))
+        return busy < share
 
     def latch_free(self, e: dict) -> bool:
         """Whether E's reads have a source the login's latch does not hold, so it is judged while the latch holds:
@@ -14161,7 +14258,8 @@ class LandQueue:
              "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_reason(self.queue_quota_reason, 160)}
              if self.queue_quota_until > self.now else None,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
-                                                       "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
+                                                       "waitingS": int(self.now - oldest[0]) if oldest[0] else None},
+             "slotHeld": self.slot_held()})
 
     def reset_cap(self) -> int:
         """land.json "resetJudgesPerMinute", else LAND_RESET_JUDGES_PER_MIN; 0: no stagger after a latch lifts."""
@@ -14340,13 +14438,18 @@ class LandQueue:
         ready = data.get("state") == "OPEN" and data.get("mergeStateStatus") == "CLEAN" \
             and not land_checks_running(data, head)
         tier = self.judge_tier(e)
+        # a re-read (reread: its last answer judged nothing at this head) is never "one merge away", and goes behind
+        # every other due entry: a lane VM, 2026-11-22, three CLEAN-looking PRs judged "unreadable" every few
+        # minutes sorted first each time a worker freed, and 27 lands due for hours never got one (LAND_REREAD_SHARE)
+        again = self.reread(e)
+        ready = ready and not again
         if self.due(e):
-            return tier, (0 if ready else 1), 0, self.due_since(e)
+            return tier, (0 if ready else 1), (1 if again else 0), self.due_since(e)
         at = (e.get("explain") or {}).get("at")
         if not isinstance(at, (int, float)) or isinstance(at, bool):
             at = e.get("created")
         since = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
-        return tier, (0 if ready else 1), 1, since
+        return tier, (0 if ready else 1), 2, since
 
     def submit(self, key: str, fn: Callable[..., None], *args: Any) -> None:
         if self.inline:
@@ -14359,6 +14462,8 @@ class LandQueue:
             self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(land_cores(), self.workers()),
                                                               thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
+        self.job_started[key] = (self.now, getattr(fn, "__name__", "job"))
+        self.slot_held_logged.discard(key)
 
     def wake_near(self, e: dict) -> bool:
         """True while E is parked and its wake is within LAND_WAKE_PREFETCH: its PR is read at full pace for that last
@@ -15008,6 +15113,12 @@ class LandQueue:
             return False
         if not self.login_room(e):
             self.gated(e)  # its reads spend the login: the login's share of the workers is busy
+            return False
+        if self.hold_spent(e):
+            self.gated(e, "held its workers LAND_HOLD_MAX this window judging nothing")  # LAND_HOLD_MAX
+            return False
+        if not self.reread_room(e):
+            self.gated(e, "re-reads of unreadable PRs hold their share of the workers")  # LAND_REREAD_SHARE
             return False
         if not self.load_room(e):
             self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
@@ -16249,7 +16360,8 @@ class LandQueue:
               "head": e.get("head") or ""}
         repeat = land_stop_repeats(e.get("lastStop"), st)
         e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
-        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince"):
+        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince",
+                     "holdWindow"):
             e.pop(held, None)  # a stopped entry is held by nothing, and a rearm or requeue starts its reads afresh
         self.history(e, "stopped", code=code, reason=land_reason(reason, 160), **({"quiet": "repeat"} if repeat else {}))
         self.save(e)
@@ -16540,6 +16652,15 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
             why += f", load {dl['loadPerCore']}/core, line {LAND_LOAD_LINE})" \
                 if isinstance(dl.get("loadPerCore"), (int, float)) else ")"
         bits.append(f"due since {utc_clock(float(dl.get('since') or 0))}: {why}")
+    took = (e.get("judging") or {}).get("at") if e["state"] == "judging" else \
+        (e.get("action") or {}).get("claimedAt") if e["state"] == "acting" else None
+    if isinstance(took, (int, float)) and not isinstance(took, bool) and now - took >= LAND_SLOT_HELD:
+        bits.append(f"holding a worker since {utc_clock(float(took))} (LAND_SLOT_HELD)")
+    hw = e.get("holdWindow") or {}
+    if hw.get("capped") and isinstance(hw.get("since"), (int, float)) and now - float(hw["since"]) < LAND_HOLD_WINDOW \
+            and e["state"] in ("queued", "waiting"):
+        bits.append(f"held workers {int(float(hw.get('heldS') or 0) // 60)} min judging nothing: no worker until "
+                    f"{utc_clock(float(hw['since']) + LAND_HOLD_WINDOW)} (LAND_HOLD_MAX)")
     if e.get("after") and e["state"] == "waiting_after":
         bits.append("after " + ", ".join(key_name(a) for a in e["after"]))
     la = e.get("lastAction") or {}

@@ -6325,6 +6325,18 @@ class OverloadTest(Base):
         self.assertEqual(self.daemon.batch["pr"], gg.GQL_BATCH_START)
         self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
+    def test_a_slow_502_on_a_big_batch_is_a_timeout_it_halves_and_never_takes_graphql_out(self) -> None:
+        # GitHub answers a too-heavy PR batch with 502 after 11-16 s, not 504: counted as down, it sent every PR
+        # to one-by-one REST and the batch never shrank. A 502 that took past GQL_SLOW_5XX_AFTER is a timeout.
+        keys = self.watch(20)
+        self.transport(lambda prs: (502, b"{}") if len(prs) > 5 else None)
+        with mock.patch.object(gg, "GQL_SLOW_5XX_AFTER", 0.0):
+            self.daemon.tick(NOW)
+        self.assertLessEqual(self.daemon.batch["pr"], 5)
+        self.assertEqual(self.daemon.gql_down_streak, 0)
+        self.assertFalse(self.daemon.gql_down())
+        self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
+
     def test_a_heavy_pr_backs_off_and_rejoins_once_it_answers(self) -> None:
         self.watch(6)
         poison = [3]
@@ -30704,6 +30716,37 @@ class AppPoolTest(Base):
         self.assertEqual(left, [])
         self.assertIn("pr:o/r#1", self.daemon.deferred)
         self.assertEqual(self.daemon.deferred & set(app_keys), set())
+
+    def test_a_paced_login_chunk_defers_only_itself(self) -> None:
+        """A chunk the login's pace holds (an owner with no App) waits alone: the App-answered chunks queued behind it
+        are read this tick, since the login's pace is not theirs to keep."""
+        self.daemon.gql_log = [(self.daemon.clock() - 5, "head", 42)]
+        self.assertFalse(self.daemon.gql_room(1), "the login's minute is spent")
+        keys = ["pr:other/r#1"] + [f"pr:manaflow-ai/cmux#{i}" for i in range(1, 13)]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
+        entries[0]["waitedAt"] = NOW  # waited: its chunk goes first in the queue
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 10
+        self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        self.assertEqual(sorted(k for chunk in sent for k in chunk), sorted(keys[1:]), "every App chunk read")
+        self.assertIn("pr:other/r#1", self.daemon.deferred)
+        self.assertFalse(self.daemon.deferred & set(keys[1:]))
+
+    def test_a_missing_pr_number_is_the_apps_answer_not_a_refusal(self) -> None:
+        """GitHub's own words (asked with the ci-watch App, 2026-11-22): a missing PR is the alias's answer, the same on
+        the login; a repository the installation does not cover is a refusal that keeps the route on the login."""
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){x}", "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 9}}
+        self.app_answers.append((200, {}, json.dumps({"data": {"p0": {"pullRequest": None}}, "errors": [
+            {"type": "NOT_FOUND", "path": ["p0", "pullRequest"],
+             "message": "Could not resolve to a PullRequest with the number of 9."}]}).encode()))
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual((len(self.app_calls), len(self.gh.calls), self.pool.unreadable), (1, 0, {}))
+        self.app_answers.append((200, {}, json.dumps({"data": {"p0": None}, "errors": [
+            {"type": "NOT_FOUND", "path": ["p0"],
+             "message": "Could not resolve to a Repository with the name 'manaflow-ai/cmux'."}]}).encode()))
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 1), "a repository it lacks goes on the login")
+        self.assertTrue(self.pool.unreadable)
 
     def test_a_login_secondary_hold_holds_the_login_but_not_the_app(self) -> None:
         """The login's secondary limit (or a latch mark another caller wrote) is the login's: an installation token has

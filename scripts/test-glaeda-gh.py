@@ -32155,6 +32155,121 @@ class AFlagsCaseConventionTest(unittest.TestCase):
         self.assertEqual(gg.flag_spelling_synonym(list(past)), (past, []))
 
 
+class AFlagOfAnotherCommandTest(unittest.TestCase):
+    """A flag this command does not have, but another command of this tool does, is refused by name: which
+    command has it, and the same call without it. The sibling mistakes (a command word at the wrong nesting
+    level, a flag in another case convention, a kind with a separator) are all routed or named already; a
+    flag borrowed from a sibling command was the one left to argparse's bare "unrecognized arguments"."""
+
+    def setUp(self) -> None:
+        # A usage refusal writes file descriptor 2 through `say_waiting`, which `redirect_stderr` does not
+        # touch (it swaps `sys.stderr`): the wording is asserted through that seam, as `diagnostics_in` does.
+        self.err = io.StringIO()
+        said = mock.patch.object(gg, "say_waiting", lambda line: print(line, file=self.err))
+        said.start()
+        self.addCleanup(said.stop)
+
+    def refuse(self, argv: list[str]) -> None:
+        """Run a call this tool must refuse as a usage error. `Parser.error` exits 64 rather than returning
+        it, because argparse never hands control back: a caller branching on the code sees a process exit."""
+        with self.assertRaises(SystemExit) as exit_:
+            gg.main(list(argv))
+        self.assertEqual(exit_.exception.code, 64, argv)
+
+    def test_an_unrecognized_flag_names_the_command_whose_option_it_is(self) -> None:
+        """Measured 2026-11-21: `glaeda-gh wait run o/r/ID --timeout 1500 --notify` answered "error:
+        unrecognized arguments: --notify" and nothing else, so the reader learned neither that `wait` has no
+        such flag nor that `land --notify` is the one that does -- a round trip through two --help pages."""
+        self.refuse(["wait", "run", "o/r/9", "--timeout", "10", "--notify"])
+        said = self.err.getvalue()
+        self.assertIn("--notify", said)
+        self.assertIn("no option of `wait`", said)
+        self.assertIn("land", said)  # the command that does have it
+
+    def test_the_next_step_is_the_same_call_without_the_borrowed_flag(self) -> None:
+        """A refusal names a next step that can end it, and here the call the caller meant is the one they
+        typed minus the flag that is no part of it. It is checked by parsing it, not by reading it."""
+        self.refuse(["wait", "run", "o/r/9", "--timeout", "10", "--notify"])
+        steps = [line[len("next: "):] for line in self.err.getvalue().splitlines()
+                 if line.startswith("next: ")]
+        self.assertEqual(steps, ["glaeda-gh wait run o/r/9 --timeout 10"])
+        args = gg.parser().parse_args(steps[0].split()[1:])
+        self.assertEqual((args.command, args.kind, args.timeout), ("wait", "run", 10.0))
+
+    def test_a_flag_no_command_of_this_tool_has_is_left_to_argparse(self) -> None:
+        """The bound on the claim: this says where a flag lives, so it must stay silent about a flag that
+        lives nowhere, rather than inventing a command for `--banana`."""
+        self.refuse(["wait", "run", "o/r/9", "--timeout", "10", "--banana"])
+        said = self.err.getvalue()
+        self.assertIn("unrecognized arguments: --banana", said)
+        self.assertNotIn("no option of", said)
+
+    def test_a_flag_of_a_nested_command_is_named_with_its_whole_path(self) -> None:
+        """`--reads` is `log search`'s and `log flaky`'s, not `log`'s: a reader told "it is an option of log"
+        would type `glaeda-gh log --reads`, which is another usage error. The words typed are the whole path, so
+        the fixture has to be a flag only a nested command owns -- a top-level one would pass with the nested
+        walk deleted."""
+        owners = gg.flag_commands("--reads")
+        self.assertTrue(owners, "the fixture flag must exist somewhere, or this test proves nothing")
+        self.assertTrue(all(" " in owner for owner in owners), owners)  # every owner is a nested command
+        self.assertIn("log search", owners)
+        for owner in owners:
+            node = gg.child_parser(gg.parser(), owner.split()[0])
+            for word in owner.split()[1:]:
+                node = gg.child_parser(node, word)
+            self.assertIn("--reads", gg.parser_options(node), owner)
+
+    def test_the_command_the_caller_typed_is_never_named_as_the_place_to_go(self) -> None:
+        """`flag_commands` answers "where does this flag live"; naming the command that just refused it would
+        be a next step that cannot end the refusal. The case that constrains it is a flag the typed command
+        owns alongside a sibling: `log search --reads` must be answered with `log flaky`, never with itself."""
+        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --reads=3", ["log", "search", "o/r", "pat", "--reads=3"])
+        self.assertIn("`log flaky`", hint)
+        self.assertNotIn("glaeda-gh log search --help", hint, "the command that refused it is not the way out")
+        self.assertEqual(nxt, "glaeda-gh log search o/r pat")
+
+    def test_a_sibling_of_the_typed_command_still_answers_for_its_own_flag(self) -> None:
+        """The filter drops the command that refused the flag, not its whole top-level family: `log job --reads`
+        is answered by `log search`, which is a different command that happens to share the word `log`."""
+        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --reads=5", ["log", "job", "o/r/9", "--reads=5"])
+        self.assertIn("`log search`", hint)
+        self.assertIn("no option of `log job`", hint)
+        self.assertEqual(nxt, "glaeda-gh log job o/r/9")
+
+    def test_a_word_the_caller_quoted_after_a_separator_is_not_a_borrowed_flag(self) -> None:
+        """`log search o/r -- --notify` searches for the text `--notify`: everything at or after `--` is a
+        positional the caller quoted, so nothing there is a flag of theirs to explain, and a next step that
+        dropped it would search for something else (or, with the pattern eaten, not parse at all)."""
+        self.assertEqual(gg.flag_elsewhere("unrecognized arguments: --notify",
+                                           ["log", "search", "o/r", "--", "--notify", "--notify"]), ("", ""))
+        self.assertEqual(gg.flag_elsewhere("unrecognized arguments: --notify",
+                                           ["log", "search", "o/r", "pat", "--", "--notify"]), ("", ""))
+        # One of each: the flag typed as a flag goes, the quoted copy stays, and the step still parses.
+        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --notify",
+                                      ["log", "search", "o/r", "--notify", "--", "--notify"])
+        self.assertIn("`land`", hint)
+        self.assertEqual(nxt, "glaeda-gh log search o/r -- --notify")
+        gg.parser().parse_args(nxt.split()[1:])
+
+    def test_the_hint_names_the_option_without_the_value_written_onto_it(self) -> None:
+        """`--notify=x` is the option `--notify` with a value: it is `--notify` that lives elsewhere, and
+        ``--notify=x` is no option of `wait`` reads as a flag nothing has."""
+        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --notify=x", ["wait", "run", "o/r/9", "--notify=x"])
+        self.assertIn("`--notify` is no option of `wait`", hint)
+        self.assertNotIn("--notify=x", hint)
+        self.assertEqual(nxt, "glaeda-gh wait run o/r/9")
+
+    def test_the_json_refusal_carries_the_same_words(self) -> None:
+        """A caller reading --json gets the refusal as its document, not only on stderr (output contract)."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.refuse(["wait", "run", "o/r/9", "--timeout", "10", "--notify", "--json"])
+        doc = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertFalse(doc["ok"])
+        self.assertIn("no option of `wait`", doc["reason"])
+        self.assertIn("glaeda-gh wait run o/r/9 --timeout 10 --json", doc["next"])
+
+
 class WaitLeashReplayTest(Base):
     """Leo, 2026-11-21: "the leash thing, right? Like you have a timeout or whatever on things. And if it's too
     short, it's like bullshit because it just instantly flails over when it dies. But you can do better."

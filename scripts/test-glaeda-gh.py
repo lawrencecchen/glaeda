@@ -15438,7 +15438,12 @@ class PostTest(unittest.TestCase):
                            (403, {}, {"message": "Resource not accessible by integration"}),
                            (502, {}, {}), *[(200, {}, []), (502, {}, {})] * (gg.POST_ATTEMPTS - 1))
         self.step(d, NOW)
-        self.assertEqual(gg.post_state(bad["id"])["error"], "HTTP 404: Not Found")
+        # Not the bare "HTTP 404: Not Found" this pinned before: the line now names the target it could not reach,
+        # which is the word a caller gets wrong (AWriteGithubRefusedNamesWhatItRefusedTest). GitHub's own status and
+        # message still lead it, which is what readers key on.
+        failed = gg.post_state(bad["id"])["error"]
+        self.assertTrue(failed.startswith("HTTP 404: Not Found"), failed)
+        self.assertIn("o/r#404", failed)
         self.step(d, NOW + gg.POST_SPACING)  # a permission refusal fails; it does not hold the queue
         self.assertEqual(gg.post_state(forbidden["id"])["state"], "failed")
         self.assertEqual(d.post_hold, 0.0)
@@ -16202,6 +16207,93 @@ class PostBodyGuardTest(unittest.TestCase):
         pr = {"repo": "o/r", "kind": "pr", "title": "T", "head": "h", "base": "b"}
         self.assertEqual(gg.body_guard_args(pr, "F"), ["pr", "create", "-R", "o/r", "--title", "T", "--head", "h",
                                                         "--base", "b", "--body-file", "F"])
+
+
+class AWriteGithubRefusedNamesWhatItRefusedTest(unittest.TestCase):
+    """A queued write that GitHub refuses records one line, and that line is all its caller ever sees: the item is
+    moved to posted/ and the caller reads it back with `post status ID`. Two shapes said nothing usable.
+
+    2026-11-21, measured on this host: `post pr manaflow-ai/glaeda ...` (glaeda is teamleaderleo/glaeda) recorded
+    `failed: HTTP 422: Validation Failed (invalid)`, and `post comment manaflow-ai/glaeda#2395` recorded
+    `failed: HTTP 404: Not Found`. Neither names the repository, which is the one word that was wrong, and `(invalid)`
+    is GitHub's `code` with its `resource` and `field` dropped -- so the write looked like a bad body or a bad head.
+    Five more calls went into finding out, which is the cost this measures."""
+
+    PR_422 = {"message": "Validation Failed",
+              "errors": [{"resource": "PullRequest", "field": "head", "code": "invalid"}]}
+
+    def test_a_validation_error_with_no_message_still_names_its_resource_and_field(self) -> None:
+        line = gg.write_failure({"kind": "pr", "repo": "o/r", "head": "b", "base": "main"}, 422, self.PR_422)
+        self.assertIn("PullRequest.head", line, "GitHub's resource and field, not just its code")
+        self.assertIn("invalid", line)
+        self.assertIn("Validation Failed", line)
+
+    def test_githubs_own_message_is_preferred_where_it_has_one(self) -> None:
+        doc = {"message": "Validation Failed", "errors": [{"resource": "PullRequest", "code": "custom",
+                                                           "message": "No commits between main and b"}]}
+        line = gg.write_failure({"kind": "pr", "repo": "o/r", "head": "b", "base": "main"}, 422, doc)
+        self.assertIn("No commits between main and b", line)
+        self.assertNotIn("custom", line, "the code adds nothing once GitHub has written the sentence")
+
+    def test_a_404_on_a_write_names_the_repository_and_the_number_it_could_not_reach(self) -> None:
+        # Not Found on a write is one of two things and the item knows both: the repo (wrong owner, renamed, no
+        # access) or the number. Bare "HTTP 404: Not Found" leaves the caller to guess which.
+        line = gg.write_failure({"kind": "comment", "repo": "manaflow-ai/glaeda", "number": 2395}, 404,
+                                {"message": "Not Found"})
+        self.assertIn("manaflow-ai/glaeda", line)
+        self.assertIn("2395", line)
+
+    def test_a_repository_of_that_name_known_here_under_another_owner_is_named(self) -> None:
+        # The owner is the word a caller gets wrong, and this host already knows the right one: broker-repos.json
+        # maps the slugs it has checkouts for. A hint, not a refusal: the write was already tried.
+        known = {"teamleaderleo/glaeda": "/home/x/glaeda", "manaflow-ai/cmux": "/home/x/cmux"}
+        line = gg.write_failure({"kind": "comment", "repo": "manaflow-ai/glaeda", "number": 2395}, 404,
+                                {"message": "Not Found"}, known=known)
+        self.assertIn("teamleaderleo/glaeda", line, "the slug this host does have a checkout of")
+
+    def test_a_repository_name_known_nowhere_here_adds_no_guess(self) -> None:
+        line = gg.write_failure({"kind": "comment", "repo": "o/nothing-like-this", "number": 5}, 404,
+                                {"message": "Not Found"}, known={"teamleaderleo/glaeda": "/home/x/glaeda"})
+        self.assertNotIn("glaeda", line, "a name that matches nothing is not guessed at")
+
+    def test_the_repo_it_did_reach_is_not_second_guessed(self) -> None:
+        # The same repository name under the owner that was asked for: nothing to suggest, and suggesting it would
+        # read as "you typed the wrong owner" when the owner was right.
+        line = gg.write_failure({"kind": "comment", "repo": "teamleaderleo/glaeda", "number": 5}, 404,
+                                {"message": "Not Found"}, known={"teamleaderleo/glaeda": "/home/x/glaeda"})
+        self.assertNotIn("known here as", line)
+
+    def test_a_422_names_the_repository_it_was_writing_to(self) -> None:
+        # The incident this started from. `post pr manaflow-ai/glaeda` recorded a 422 whose every word was about the
+        # head branch, so the owner -- the word that was wrong -- was never in question. Naming the target only on
+        # 404 would leave that read in place, and it is the read that cost the five calls.
+        line = gg.write_failure({"kind": "pr", "repo": "manaflow-ai/glaeda", "head": "b", "base": "main"}, 422,
+                                self.PR_422, known={"teamleaderleo/glaeda": "/home/x/glaeda"})
+        self.assertIn("manaflow-ai/glaeda", line)
+        self.assertIn("teamleaderleo/glaeda", line, "the hint does not belong to the 404 branch")
+        self.assertNotIn("no such target", line, "422 is not a reachability verdict; only 403/404 say that")
+
+    def test_a_body_with_nothing_to_add_adds_no_empty_punctuation(self) -> None:
+        # Two shapes a real GitHub body does not have, and a reader of a damaged one should not have to parse:
+        # "HTTP 404::" from an empty message, and "HTTP 404: M ()" from an error dict with no resource, field or code.
+        self.assertNotIn("::", gg.write_failure({"kind": "comment", "repo": "o/r"}, 404, {"message": ""}))
+        line = gg.write_failure({"kind": "comment", "repo": "o/r"}, 404, {"message": "M", "errors": [{}]})
+        self.assertNotIn("()", line, line)
+
+    def test_every_line_is_one_line(self) -> None:
+        # post_finish records it as the item's "error" and `post status` prints it as the last word on the write; a
+        # newline in it breaks every reader that takes the last line. The docs that carry one are the point: without
+        # them this test passes with the collapse deleted, because no fixture below has a newline of its own.
+        newlines = {"message": "Validation Failed\nsee the docs",
+                    "errors": [{"resource": "PullRequest", "field": "head", "message": "no commits\r\nbetween\tthem"}]}
+        for status, doc in ((422, self.PR_422), (404, {"message": "Not Found"}), (403, {"message": "Forbidden"}),
+                            (422, newlines), (404, {"message": "Not\nFound"})):
+            line = gg.write_failure({"kind": "comment", "repo": "manaflow-ai/glaeda", "number": 1}, status, doc,
+                                    known={"teamleaderleo/glaeda": "/x"})
+            self.assertNotIn("\n", line, line)
+            self.assertNotIn("\r", line, line)
+            self.assertNotIn("\t", line, line)
+            self.assertTrue(line.startswith(f"HTTP {status}"), line)
 
 
 class RiskReceiptPostTest(unittest.TestCase):

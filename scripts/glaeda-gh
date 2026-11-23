@@ -12822,11 +12822,11 @@ def land_command_host(command: list[str]) -> int | None:
         if word == "--":
             return i + 1 if i + 1 < len(command) else None
         if word.startswith("-") and len(word) > 1:
-            # -o VALUE, or -oVALUE / a cluster of flags with no value
-            if word[-1] in SSH_VALUE_FLAGS and len(word) == 2:
-                i += 2
-            else:
-                i += 1
+            # -o VALUE, -oVALUE, a cluster of flags with no value, or one ending in a value flag (-4o VALUE): as
+            # getopt reads it, the first value flag takes the rest of its word, else the next word
+            flag = None if word.startswith("--") else next(
+                (j for j, ch in enumerate(word[1:], 1) if ch in SSH_VALUE_FLAGS), None)
+            i += 2 if flag == len(word) - 1 else 1
             continue
         return i
     return None

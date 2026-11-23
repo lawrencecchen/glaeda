@@ -1255,7 +1255,10 @@ scripts size swift build and test `--jobs`, Swift Testing suites and webview tes
 `CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL`, `MAKEFLAGS=-jN` and git's `pack.threads` (through
 `GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`, only when the runner sets no `GIT_CONFIG_COUNT`). A variable the runner's
 environment already sets is left alone, and a step's own `env:` or inline value wins over `$GITHUB_ENV`. A job
-holding the whole mini (exclusive) or no shared unit (fast, gateway) gets no cap. The job log's admitted line says
+holding the whole mini (exclusive) gets no cap. A job holding no shared unit (the fast tier on the fast runner, a
+fast tier admitted busy, a gateway's thin client) gets the share of its own cores (its `JOB_CORES` row or its class's
+need; JOB_SHARE_UNCOUNTED): uncapped, the fast tier's `swift build --build-tests` ran at every core of ultra2 beside
+jobs capped at 4 to 12 (load 343 on 30 cores, 2026-11-22). The job log's admitted line says
 `compiles with N cores`. `GLAEDA_JOB_SHARE=0` in the runner LaunchAgent environment turns it off without a
 redeploy. A ci-step `admit` reports the same share as `cpu`, the build worker's grant for the step.
 

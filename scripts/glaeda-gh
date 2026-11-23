@@ -15303,6 +15303,7 @@ class LandQueue:
         self.overflow_after = float("-inf")
         # keys whose PR state is being read live for a forwarded row past its give-up (forward_state_reads)
         self.forward_reading: set[str] = set()
+        self.forward_awaited: set[str] = set()  # keys a waiting_after row here waits on (forwards_follow)
         self.forward_state_thread: threading.Thread | None = None
         self.forward_name_now: str | None = None  # the executor's name as repair_forwarded names it, read once a load
         self.cache_of = cache_of
@@ -15750,6 +15751,10 @@ class LandQueue:
             with self.lock:
                 if self.retire_from_cache(e):
                     return  # ended: no hold, park or worker needed to say so
+                if e["state"] == "waiting_after":
+                    self.after_wait(e)  # on record, no read: a hold below must not keep it waiting on an ended PR
+                    if e["state"] in LAND_DONE:
+                        return
             if latch is not None and not self.latch_free(e):
                 self.pass_latched += 1
                 with self.lock:
@@ -16348,11 +16353,14 @@ class LandQueue:
                     cls=LAND_FORWARD_FYI_CLASS)  # an inbox fyi, never a blocker (notice-flood.md rule 1)
 
     def retire_ended(self) -> None:
-        """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""
+        """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache), and every
+        waiting_after one whose predecessors ended stops waiting (after_wait)."""
         for key in [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs]:
             try:
                 with self.lock:
-                    self.retire_from_cache(self.entries[key])
+                    e = self.entries[key]
+                    if not self.retire_from_cache(e) and e["state"] == "waiting_after":
+                        self.after_wait(e)  # a predecessor that ended frees it under the park too
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
 
@@ -16364,6 +16372,8 @@ class LandQueue:
         if self.now < self.forward_look_at:
             return
         self.forward_look_at = self.now + LAND_FORWARD_LOOK_EVERY
+        self.forward_awaited = {a for o in self.entries.values() if o["state"] == "waiting_after"
+                                for a in o.get("after") or []}
         due: list[str] = []
         for key in [k for k, e in self.entries.items() if e["state"] == LAND_FORWARDED and k not in self.jobs
                     and k not in self.sending and k not in self.overflowing and k not in self.forward_reading]:
@@ -16473,7 +16483,7 @@ class LandQueue:
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
                           f"closed); nothing is merged", "")
                 return False
-            return past  # a copy older than the row: past the give-up, read live
+            return past or self.forward_state_wanted(e)  # a copy older than the row: read live
         # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
         if state == "OPEN" and not past and self.stop_moved_pin(e, c, data):
             return False
@@ -16481,6 +16491,8 @@ class LandQueue:
         if not e.get("forwardFirst"):
             e["forwardFirst"] = first
             self.save(e)
+        if not past and self.forward_state_wanted(e):
+            return True  # read live before the give-up (forward_state_wanted)
         if past:
             head = str(data.get("headRefOid") or "").lower()
             if state == "OPEN" and self.now - read_at <= LAND_FORWARD_STATE_FRESH and SHA40.fullmatch(head):
@@ -16518,9 +16530,20 @@ class LandQueue:
         self.hand_off_now(e, head, why, "forward_resent")
         return False
 
+    def forward_state_wanted(self, e: dict) -> bool:
+        """Under the lock. Whether forwarded E's PR is read live before its give-up (forward_state_reads, then
+        forward_settle): a waiting_after row here waits on it, at most once per LAND_PEEK_EVERY. Its PR merged or
+        closed outside the queue then ends it, and the row behind it stops waiting (after_wait), instead of both
+        waiting until the give-up (2 h) on a copy that read open after the hand-off and that nothing reads again."""
+        return e["key"] in self.forward_awaited and \
+            self.now - float(e.get("forwardStateAt") or 0) >= LAND_PEEK_EVERY and \
+            not self.queue_quota_parked()  # a park holds every read of the login it spent
+
     def forward_settle(self, e: dict, state: str, merge_sha: str, head: str, why: str, executor: bool = False,
                        how: str = "read live") -> None:
-        """Under the lock. A forwarded E past its give-up, on its PR's STATE (empty: unread, WHY says why):
+        """Under the lock. A forwarded E read before its give-up (forward_state_wanted): MERGED or CLOSED ends it as
+        the cache's copy would (forward_follow), anything else keeps it forwarded. One past its
+        give-up, on its PR's STATE (empty: unread, WHY says why):
         - MERGED or CLOSED: ended with that outcome, nobody told.
         - OPEN at HEAD: landed again on this host, pinned at HEAD, once (forward_reland), nobody told.
         - OPEN after that re-land, or unread LAND_FORWARD_STATE_TRIES times: stopped forward_no_outcome, its requester
@@ -16529,6 +16552,17 @@ class LandQueue:
             return  # it moved on while its state was read
         host = str(e.get("forwardedTo") or "the host it was handed to")
         e["forwardStateAt"] = self.now
+        first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
+        if self.now - first <= LAND_FORWARD_GIVE_UP:  # read early (forward_state_wanted): an end ends it, as the cache's
+            if state == "MERGED":
+                self.merged(e, merge_sha or e.get("mergeSha") or "", f"forwarded to {host}: {how} merged")
+                return
+            if state == "CLOSED":
+                self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue ({how} closed); "
+                          "nothing is merged", "")
+                return
+            self.save(e)
+            return
         if state == "MERGED":
             sha = merge_sha or e.get("mergeSha") or ""
             e.update(state="merged", mergeSha=sha, wait=None, wakeAt=None, action=None)
@@ -17630,44 +17664,8 @@ class LandQueue:
             if SHA40.fullmatch(head) and (e.get("pinSha") or not SHA40.fullmatch(cached) or cached == head):
                 self.hand_off_now(e, head, str(infra.get("why") or "GitHub could not be read here"), "handoff_infra")
                 return
-        pending, stopped = [], None
-        for a in e.get("after") or []:
-            ad = (self.cache_of(a) or {}).get("data") or {}
-            ae = self.entries.get(a)
-            if ad.get("state") == "MERGED" or (ae and ae["state"] == "merged"):
-                continue
-            if ad.get("state") == "CLOSED":
-                self.stop(e, "after_closed", f"{key_name(a)}, which it lands after, was closed without being merged",
-                          f"glaeda-gh land {key_name(e['key'])} (without --after) once its base is right")
-                return
-            if ae and ae["state"] == "cancelled":
-                self.stop(e, "after_cancelled", f"{key_name(a)}, which it lands after, was cancelled",
-                          f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
-                return
-            if ae and ae["state"] == "stopped" and stopped is None:
-                stopped = (a, ae)
-            if ae is None and (e.get("afterStopped") or {}).get("key") == a:
-                # It stopped, and its entry aged out (LAND_KEEP) before this one's wait ran out: nothing would ever
-                # resume or stop this one (review of glaeda#2174, F3)
-                self.stop(e, "after_stopped", f"{key_name(a)}, which it lands after, stopped and is no longer queued "
-                          "(its land entry aged out)",
-                          f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
-                return
-            pending.append(a)
-        if stopped and self.after_stopped(e, *stopped):
+        if self.after_wait(e):
             return
-        if not stopped and e.get("afterStopped"):
-            self.history(e, "after_resumed", after=(e.pop("afterStopped") or {}).get("key"))
-            self.save(e)
-        if pending:
-            if e["state"] != "waiting_after":
-                e["state"] = "waiting_after"
-                self.history(e, "waiting_after", after=",".join(pending))
-                self.save(e)
-            return
-        if e["state"] == "waiting_after":
-            e["state"], e["wait"], e["wakeAt"], e["dueAt"] = "queued", None, None, self.now
-            self.history(e, "after_merged")  # judged at once: its base may need an update or a retarget
         head = str(data.get("headRefOid") or "").lower()
         fp = land_fingerprint(c)
         w = e.get("wait") or {}
@@ -17923,6 +17921,53 @@ class LandQueue:
                 self.submit(e["key"], self.refresh_job, e["key"])
             self.save(e)
         return True
+
+    def after_wait(self, e: dict) -> bool:
+        """Under the lock. E's --after PRs, on what is on record here (the daemon's copies and this queue's rows, no
+        GitHub call): True while E waits on one (waiting_after) or stopped for one; else a waiting_after E is queued
+        again (after_merged). Run on every pass for a waiting_after row before a latch, stagger or park holds it
+        (pass_one, retire_ended): a predecessor merged outside the queue, its own row ended by forward_follow or its
+        copy read, frees it then, not when the login does."""
+        pending, stopped = [], None
+        for a in e.get("after") or []:
+            ad = (self.cache_of(a) or {}).get("data") or {}
+            ae = self.entries.get(a)
+            if ad.get("state") == "MERGED" or (ae and ae["state"] == "merged"):
+                continue
+            if ad.get("state") == "CLOSED":
+                self.stop(e, "after_closed", f"{key_name(a)}, which it lands after, was closed without being merged",
+                          f"glaeda-gh land {key_name(e['key'])} (without --after) once its base is right")
+                return True
+            if ae and ae["state"] == "cancelled":
+                self.stop(e, "after_cancelled", f"{key_name(a)}, which it lands after, was cancelled",
+                          f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
+                return True
+            if ae and ae["state"] == "stopped" and stopped is None:
+                stopped = (a, ae)
+            if ae is None and (e.get("afterStopped") or {}).get("key") == a:
+                # It stopped, and its entry aged out (LAND_KEEP) before this one's wait ran out: nothing would ever
+                # resume or stop this one (review of glaeda#2174, F3)
+                self.stop(e, "after_stopped", f"{key_name(a)}, which it lands after, stopped and is no longer queued "
+                          "(its land entry aged out)",
+                          f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
+                return True
+            pending.append(a)
+        if stopped and self.after_stopped(e, *stopped):
+            return True
+        if not stopped and e.get("afterStopped"):
+            self.history(e, "after_resumed", after=(e.pop("afterStopped") or {}).get("key"))
+            self.save(e)
+        if pending:
+            if e["state"] != "waiting_after":
+                e["state"] = "waiting_after"
+                self.history(e, "waiting_after", after=",".join(pending))
+                self.save(e)
+            return True
+        if e["state"] == "waiting_after":
+            e["state"], e["wait"], e["wakeAt"], e["dueAt"] = "queued", None, None, self.now
+            self.history(e, "after_merged")  # judged at once: its base may need an update or a retarget
+            self.save(e)
+        return False
 
     def after_stopped(self, e: dict, a: str, ae: dict) -> bool:
         """E lands after A, whose land stopped (LAND_AFTER_STOPPED_WAIT): E keeps waiting for A, telling its requester

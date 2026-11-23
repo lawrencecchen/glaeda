@@ -23655,6 +23655,9 @@ class LandTest(Base):
         retry = mock.patch.object(gg, "LAND_NOTIFY_RETRY_S", 0.0)  # a refused notice's resends, never a real sleep
         retry.start()
         self.addCleanup(retry.stop)
+        busy = mock.patch.object(gg, "LAND_NOTIFY_BUSY_RETRY_S", 0.0)
+        busy.start()
+        self.addCleanup(busy.stop)
         # The CLI (`glaeda-gh land`) resolves land-judge from the host's land.json and defaults: pin the defaults to
         # the fake one, so the tests never depend on the host having a leo-workspace checkout (a CI runner has none).
         paths = mock.patch.object(gg, "LAND_JUDGE_PATHS", (Path(self.w.mh),))
@@ -28843,6 +28846,40 @@ class LandTest(Base):
         self.tick()
         self.assertEqual(len(tries), gg.LAND_NOTIFY_TRIES)
         self.assertEqual([n[0] for n in self.w.notices].count("land-notify-failed"), 1)
+
+    def test_a_notice_to_an_ended_session_is_sent_once_and_a_busy_hub_is_resent_later(self):
+        # cmux-cp-1, 2026-11-22 18Z-11-23 02Z: ~190 of 307 land-notify-failed were acpmux's no_session, resent twice
+        # 5 s apart into a session that had ended; 78 were the mesh hub's 429/503, resent into the same limit.
+        cases = {"gone": ('acpmux: no_session: no session matches "huge-blue/x"; run `acpmux ls`', 1, []),
+                 "busy": ("acpmux: runtime: the mesh hub did not take it: the hub answered 429 mesh.rate_limited",
+                          gg.LAND_NOTIFY_TRIES, [30.0, 60.0])}
+        for name, (why, sent, slept) in cases.items():
+            with self.subTest(name):
+                self.w.notices.clear()
+                self.pr(LA)
+                self.land()
+                self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+                real, tries, sleeps = self.w.run, [], []
+
+                def refusing(argv, timeout, env):
+                    if argv[0] == "/fake/acpmux":
+                        tries.append(argv)
+                        return subprocess.CompletedProcess(argv, 1, "", why)
+                    return real(argv, timeout, env)
+                self.q.run = refusing
+                lines: list[dict] = []
+                with mock.patch.object(gg, "log", lines.append), mock.patch.object(gg, "LAND_NOTIFY_BUSY_RETRY_S", 30.0), \
+                        mock.patch.object(gg.time, "sleep", sleeps.append):
+                    self.tick()
+                self.assertEqual(len(tries), sent)
+                self.assertEqual(sleeps, slept)
+                events = [ln.get("event") for ln in lines]
+                if name == "gone":
+                    self.assertIn("land-notify-no-session", events)
+                    self.assertNotIn("land-notify-failed", events)
+                    self.assertNotIn("land-notify-failed", [n[0] for n in self.w.notices])
+                else:
+                    self.assertIn("land-notify-failed", events)
 
     def test_a_requester_named_none_is_nobody(self):
         with mock.patch.object(gg, "policy_host", return_value="hostx"), mock.patch.dict(os.environ, {}, clear=True):
@@ -35686,11 +35723,11 @@ class AppPoolTest(Base):
                          "the spare writing its own bench keeps ci-watch's")
 
     # Another organization's IP allow list at one node's path (foreign_ip_refusal): that node leaves the App, never
-    # the repository. The path is the one GitHub gives a check suite's app another organization owns.
+    # the repository. The path is one GitHub gives a head repository another organization owns (a check suite's
+    # `app` alone is part of the answer instead: foreign_app_forbidden).
     FOREIGN = ("Although you appear to have the correct authorization credentials, the `other-org` organization has "
                "an IP allow list enabled, and your IP address is not permitted to access this resource.")
-    APP_PATH = ["p1", "pullRequest", "commits", "nodes", 0, "commit", "statusCheckRollup", "contexts", "nodes", 3,
-                "checkSuite", "app"]
+    APP_PATH = ["p1", "pullRequest", "headRepository"]
 
     def two_pr_query(self, *numbers: int) -> dict:
         query, variables = gg.pr_query([f"pr:manaflow-ai/cmux#{n}" for n in numbers])
@@ -35815,6 +35852,81 @@ class AppPoolTest(Base):
             self.daemon.suite_runs(["S1", "S2", "S3"], paced=False, route=["manaflow-ai/cmux"])
         self.assertEqual(asked, [["S1", "S3"], ["S2"]])
 
+    # A recorded answer (the broker host cmux-cp-1, 2026-11-22T18:27Z, role land-judge, scope graphql:manaflow-ai:cmux):
+    # HTTP 200, the suite whole, and one FORBIDDEN at suiteRuns.0.app from the `cursor` organization's IP allow list.
+    CURSOR = ("Although you appear to have the correct authorization credentials, the `cursor` organization has an IP "
+              "allow list enabled, and your IP address is not permitted to access this resource.")
+
+    def cursor_suite_answer(self, extra: list | None = None) -> None:
+        # suite_runs counts first (SUITE_COUNTS, #2599): both suites ran something, so both are read with SUITE_RUNS
+        self.app_answers.append((200, {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 json.dumps({"data": {"suiteRuns": [
+                                     {"id": "CS_kwDORDHQWM8AAAAcaN5WbA", "checkRuns": {"totalCount": 1}},
+                                     {"id": "CS_ours", "checkRuns": {"totalCount": 1}}]}}).encode()))
+        suites = [{"id": "CS_kwDORDHQWM8AAAAcaN5WbA", "conclusion": "SUCCESS", "app": None, "workflowRun": None,
+                   "checkRuns": {"pageInfo": {"hasNextPage": False}, "nodes": [
+                       {"id": "CR_1", "name": "Cursor Bugbot", "status": "COMPLETED", "conclusion": "SUCCESS",
+                        "detailsUrl": "https://cursor.com/bugbot", "databaseId": 77, "startedAt": "2026-11-22T18:00:00Z",
+                        "completedAt": "2026-11-22T18:05:00Z"}]}},
+                  {"id": "CS_ours", "conclusion": "FAILURE", "app": {"slug": "github-actions"},
+                   "workflowRun": {"databaseId": 5, "workflow": {"name": "ci", "databaseId": 9}},
+                   "checkRuns": {"pageInfo": {"hasNextPage": False}, "nodes": [
+                       {"id": "CR_2", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE",
+                        "detailsUrl": None, "databaseId": 78, "startedAt": None, "completedAt": None}]}}]
+        errors = [{"type": "FORBIDDEN", "path": ["suiteRuns", 0, "app"], "extensions": {"saml_failure": False},
+                   "locations": [{"line": 2, "column": 51}], "message": self.CURSOR}, *(extra or [])]
+        self.app_answers.append((200, {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 json.dumps({"data": {"rateLimit": {"limit": 12500, "remaining": 12000, "cost": 1,
+                                                                    "resetAt": "2026-11-22T19:00:00Z"},
+                                                      "suiteRuns": suites},
+                                             "errors": errors}).encode()))
+
+    def test_a_foreign_apps_forbidden_app_field_is_part_of_the_apps_answer_never_the_logins(self) -> None:
+        spare_calls = self.spare_pool()
+        self.cursor_suite_answer()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runs, _ = self.daemon.suite_runs(["CS_kwDORDHQWM8AAAAcaN5WbA", "CS_ours"], paced=False,
+                                             route=["manaflow-ai/cmux"])
+        self.assertEqual((len(self.app_calls), len(spare_calls), len(self.gh.calls)), (2, 0, 0),
+                         "the App's count and its read; no spare, no login")
+        self.assertEqual(self.login_reads, 0, "the login's token is not even read")
+        logged = out.getvalue()
+        for event in ("login-fallback", "app-pool-node-refused", "app-pool-refused"):
+            self.assertNotIn(f'"{event}"', logged)
+        unread = next(json.loads(l) for l in logged.splitlines() if '"app-pool-app-unread"' in l)
+        self.assertEqual((unread["paths"], unread["count"]), (["suiteRuns.0.app"], 1))
+        self.assertNotIn(APP_TOKEN, logged)
+        for pool in (self.pool, *self.pool.spares):
+            self.assertEqual(pool.unreadable, {}, f"{pool.role}: no node and no scope benched")
+            self.assertEqual(pool.rest_until, {}, f"{pool.role}: not resting")
+        self.assertFalse(self.pool.chain_benched(["id:CS_kwDORDHQWM8AAAAcaN5WbA"]))
+        cursor, ours = runs["CS_kwDORDHQWM8AAAAcaN5WbA"], runs["CS_ours"]
+        self.assertIsInstance(cursor, list, "the suite is read, not an unread suite's error")
+        self.assertEqual([(r["name"], r["conclusion"]) for r in cursor], [("Cursor Bugbot", "SUCCESS")])
+        self.assertNotIn("app", cursor[0]["checkSuite"], "an unread App is no app at all, not a null one")
+        self.assertNotIn("appNull", gg.run_identity(cursor[0], cursor[0]["checkSuite"]))
+        self.assertEqual(ours[0]["checkSuite"]["app"], {"slug": "github-actions"}, "the other suite keeps its App")
+        # the next read of that suite goes on the App again (nothing benched it)
+        self.cursor_suite_answer()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.daemon.suite_runs(["CS_kwDORDHQWM8AAAAcaN5WbA"], paced=False, route=["manaflow-ai/cmux"])
+        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (4, 0))
+
+    def test_an_unread_app_beside_another_refusal_or_on_the_owners_own_list_is_refused_as_before(self) -> None:
+        other = {"type": "FORBIDDEN", "path": ["suiteRuns", 1], "message": "Resource not accessible by integration"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.cursor_suite_answer(extra=[other])
+            runs, _ = self.daemon.suite_runs(["CS_kwDORDHQWM8AAAAcaN5WbA", "CS_ours"], paced=False,
+                                             route=["manaflow-ai/cmux"])
+        self.assertEqual(len(self.gh.calls), 1, "a real refusal still goes on the login")
+        self.assertEqual(set(self.pool.unreadable), {"graphql:manaflow-ai:cmux"})
+        self.assertFalse(gg.foreign_app_forbidden("cursor", {"type": "FORBIDDEN", "path": ["suiteRuns", 0, "app"],
+                                                             "message": self.CURSOR}), "the owner's own list")
+        self.assertFalse(gg.foreign_app_forbidden("manaflow-ai", {"type": "FORBIDDEN", "path": ["suiteRuns", 0],
+                                                                  "message": self.CURSOR}), "a whole suite")
+        self.assertFalse(gg.foreign_app_forbidden("manaflow-ai", {"type": "NOT_FOUND", "path": ["x", "app"],
+                                                                  "message": self.CURSOR}))
     # The broker host, 2026-11-22 23:39Z-00:46Z: 165 login-fallback lines, all last-real-attempt, 89 "refused" and 55
     # "pool-resting". A suite another App made and never ran (its App's organization has an IP allow list) was asked
     # `app { slug }` and refused, so it was benched and read on the login, and the bench was misnamed "pool-resting".
@@ -35866,18 +35978,23 @@ class AppPoolTest(Base):
         self.assertNotIn("login-fallback", out.getvalue())
         self.assertEqual(self.pool.unreadable, {}, "nothing benched")
 
-    def test_another_orgs_suite_that_ran_something_still_goes_on_the_login_and_is_named_node_benched(self) -> None:
+    def test_another_orgs_suite_that_ran_something_stays_on_the_app_with_its_app_unread(self) -> None:
+        # #2599 left this suite on the login (node-benched); its FORBIDDEN `app` is part of the App's answer now
+        # (foreign_app_forbidden), so it is read on the App every time, never benched.
         kinds, full = self.suite_app({"S1": 1, "S2": 0}, foreign={"S1"})
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             first, _ = self.daemon.suite_runs(["S1", "S2"], paced=False, route=["manaflow-ai/cmux"])
             again, _ = self.daemon.suite_runs(["S1", "S2"], paced=False, route=["manaflow-ai/cmux"])
         self.assertEqual((first["S2"], again["S2"]), ([], []))
-        self.assertEqual(set(self.pool.unreadable), {"node:id:S1"})
-        self.assertEqual(kinds, ["count", "runs", "count"], "the benched suite is not counted again on the App")
-        causes = [json.loads(l)["cause"] for l in out.getvalue().splitlines() if '"login-fallback"' in l]
-        self.assertEqual(causes, ["refused", "node-benched"], "a node bench is not a resting pool")
-        self.assertEqual(len(self.gh.calls), 2)
+        for got in (first, again):
+            self.assertEqual([r["name"] for r in got["S1"]], ["job0"])
+            self.assertNotIn("app", got["S1"][0]["checkSuite"], "unread, not GitHub's null app")
+        self.assertEqual(self.pool.unreadable, {}, "nothing benched")
+        self.assertEqual(kinds, ["count", "runs", "count", "runs"])
+        self.assertEqual(full, [["S1"], ["S1"]])
+        self.assertNotIn('"login-fallback"', out.getvalue())
+        self.assertEqual(self.gh.calls, [], "nothing on the login")
 
     def test_a_count_the_app_could_not_read_is_read_with_suite_runs_never_greener(self) -> None:
         answers = iter([({"data": {"suiteRuns": [None, {"id": "S2", "checkRuns": None}, {"id": "SX", "checkRuns":

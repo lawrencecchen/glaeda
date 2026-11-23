@@ -14128,8 +14128,12 @@ LAND_LATE_WHY_EVERY = 60.0
 # VM held 71 forwards older than 30 min, 63 of them with no copy of the PR left to say whether it ever ended. Past
 # LAND_FORWARD_QUIET with no ending the PR is read once (the daemon's one-off read), and unless that read shows it
 # merged or closed the requester is told once per hand-off: where it went, how long ago, and what to run.
+# huge-blue, 2026-11-23 09:04-09:14Z: about 20 of these in 10 min reached the coordinator as [blocker]s, the same PR
+# up to three times (cmux#18775: each re-send or re-land is a new hand-off), most saying only that no read here said
+# it ended. Now a row is told only on a read that shows its PR still open, once per PR ever (forwardQuietTold, kept on
+# the row), as an inbox fyi; a read that never lands tells nobody: forward_follow's give-up reads it live and settles it.
 LAND_FORWARD_QUIET = LAND_DUE_LATE
-LAND_FORWARD_READ_WAIT = 300.0  # how long the told-once waits on that one read before telling with no read
+LAND_FORWARD_READ_WAIT = 300.0  # how long the told-once waits on that one read before giving up on it, telling nobody
 LAND_FORWARD_READS = 8  # one-off reads a pass asks for these rows at most (a deploy over 73 old forwards: 10 passes)  # a due-late row's reason is rewritten at most this often (note_late)
 # A job (a judgment, a merge or other step, a PR read) that has held its worker this long is logged once
 # ("land-slot-held"), named in the land-pool line ("slotHeld": the one holding longest) and in its status line, so a
@@ -15607,6 +15611,7 @@ class LandQueue:
             # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
             if not str(rid or "").startswith("forward-reland-"):
                 e.pop("forwardRelanded", None)
+                e.pop("forwardQuietTold", None)  # a land by hand is a new ask: it may be told once again
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
                          **land_override_history(e), **land_nominated_history(e))
         else:
@@ -16256,8 +16261,8 @@ class LandQueue:
 
     def forwards_unjudged(self) -> None:
         """Every forwarded row LAND_FORWARD_QUIET past its forward with no ending on record: its PR is read once, and
-        unless a copy read since the forward shows it merged or closed, its requester is told once per forward
-        (forward_quiet). A cache file read per row, and one one-off read per row past the bound."""
+        only a read that shows it still open tells its requester, once per PR (forwardQuietTold), as an fyi; a read
+        that never lands tells nobody (forward_quiet). A cache file read per row, and one one-off read per row past the bound."""
         self.forward_reads = 0
         for key in [k for k, e in self.entries.items() if e.get("state") == LAND_FORWARDED and k not in self.jobs]:
             try:
@@ -16286,7 +16291,9 @@ class LandQueue:
             return  # past the give-up its PR is read and settled, telling nobody when it ended (forward_settle)
         quiet = e.get("forwardQuiet") or {}
         if float(quiet.get("since") or 0) == since:
-            return  # this forward was told (or seen ended) once
+            return  # this forward was told (or seen ended, or its read given up on) once
+        if e.get("forwardQuietTold") or quiet.get("to"):
+            return  # this PR's requester was told once (a "to" is a tell from before forwardQuietTold): never again
         key = e["key"]
         c = self.cache_of(key) or {}
         data = c.get("data") or {}
@@ -16308,15 +16315,25 @@ class LandQueue:
                     self.peek(key)
                 return
             if self.now - peeked < LAND_FORWARD_READ_WAIT:
-                return  # the one read is asked; tell once it lands, or once its wait is out
+                return  # the one read is asked; tell once it lands
+            # its wait is out and nothing here read the PR: no word on a state nobody read (forward_follow's
+            # give-up reads it live, ends a merged or closed one quietly and lands an open one again)
+            e["forwardQuiet"] = {"since": since, "at": self.now, "unread": True}
+            self.history(e, "forward_quiet", waited=round(self.now - since), read=False, told=False)
+            self.save(e)
+            log({"event": "land-forward-quiet", "key": key, "waited": round(self.now - since), "read": False,
+                 "told": False})
+            return
+        if state != "OPEN":
+            return  # a copy that names no state says nothing to tell
         to = str(e.get("forwardedTo") or (e.get("handedOff") or {}).get("host") or "the far host")
         head = str((e.get("handedOff") or {}).get("head") or e.get("pinSha") or e.get("head") or "")
         live = str(data.get("headRefOid") or "").lower()
         mins = round((self.now - since) / 60)
-        seen = (f"the PR still reads open at {live[:12]}" if read and state == "OPEN" and live
-                else "no read of the PR here says it ended")
+        seen = f"the PR still reads open at {live[:12]}" if live else "the PR still reads open"
         nxt = f"glaeda-gh land {e['repo']}#{e['number']}" + (f" --sha {live}" if SHA40.fullmatch(live) else "")
         e["forwardQuiet"] = {"since": since, "at": self.now, "to": to, "head": head, "read": bool(read)}
+        e["forwardQuietTold"] = {"at": self.now, "since": since, "to": to}
         self.history(e, "forward_quiet", to=to, head=head[:12], waited=round(self.now - since), read=bool(read))
         self.save(e)
         log({"event": "land-forward-quiet", "key": key, "to": to, "head": head, "waited": round(self.now - since),
@@ -16324,7 +16341,8 @@ class LandQueue:
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} was handed to {to} {mins} min ago"
                     + (f" at {head[:12]}" if head else "") + f" and no verdict has come back ({seen}); "
-                    f"`glaeda-gh land status` on {to} says where it is, or queue it again: {nxt}")
+                    f"`glaeda-gh land status` on {to} says where it is, or queue it again: {nxt}",
+                    cls=LAND_FORWARD_FYI_CLASS)  # an inbox fyi, never a blocker (notice-flood.md rule 1)
 
     def retire_ended(self) -> None:
         """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""
@@ -16576,6 +16594,9 @@ class LandQueue:
         naming why and the way on; its requester is told as an inbox fyi, never a blocker."""
         first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
         e["forwardGaveUp"] = self.now  # read before it stopped: repair_forwarded never reopens it
+        told = bool(e.get("forwardQuietTold") or (e.get("forwardQuiet") or {}).get("to"))  # one fyi a PR (LAND_FORWARD_QUIET's comment): told once, no second
+        if not told:
+            e["forwardQuietTold"] = {"at": self.now, "since": first, "to": host, "by": "forward_give_up"}
         cause = f"the PR is still {state.lower()}; {why}" if state else why
         resends = int((e.get("forwardResent") or {}).get("n") or 0)
         if resends:
@@ -16584,7 +16605,7 @@ class LandQueue:
                   f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
                   f"still merge it; nothing here does",
                   f"read its row on {host} (glaeda-gh land status there), or land it again: glaeda-gh land "
-                  f"{key_name(e['key'])} (--sha HEAD to pin it)", tell="fyi")
+                  f"{key_name(e['key'])} (--sha HEAD to pin it)", tell="quiet" if told else "fyi")
 
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
@@ -18203,6 +18224,21 @@ class LandQueue:
                    if self.now - float(((self.entries.get(k) or {}).get("snapshotWait") or {}).get("since") or 0)
                    < LAND_SNAPSHOT_WAIT)
 
+    def room_starved(self, e: dict, sha: str) -> bool:
+        """True when E, due at least LAND_SNAPSHOT_WAIT with a worker free, found no room ahead of the workers to
+        start its own snapshot wait: it is judged live now, as a wait that ran out would have been by then. The room
+        bounds how many reads the waits nudge; it must not hold a row longer than a wait would. cmux-cp-1, 2026-11-23
+        08:42-10:07Z: 6-10 of 24 workers busy at load 0.12-0.78/core, 42-45 waits renewed by newer rows each pass,
+        and 78 rows due late, the oldest 85 min, every one "snapshot waits ahead fill the room (snapshotWaiting)":
+        a row with no wait of its own never got a place, so it never got the wait that ends in a live judgment."""
+        if self.now - self.due_since(e) < LAND_SNAPSHOT_WAIT:
+            return False
+        if (e.get("roomStarved") or {}).get("sha") != sha:
+            e["roomStarved"] = {"sha": sha, "at": self.now}
+            self.history(e, "snapshot_room_live", head=sha[:12], waited=round(self.now - self.due_since(e)),
+                         waits=len(self.snapshot_waiting))
+        return True
+
     def snapshot_wait(self, e: dict, sha: str, free: bool = True) -> bool:
         """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged). A wait
         that ran out with no worker FREE stays (True): it is judged live when one frees, never waits a second time."""
@@ -18632,6 +18668,8 @@ class LandQueue:
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
             waits = self.snapshot(e["key"], sha)[1] == "wait"
+            if free and waits and self.room_starved(e, sha):
+                waits = False  # judged live on the free worker, as a wait that ran out is (snapshot_wait)
             if not free or waits:
                 self.gated(e, "every worker busy" if not free else
                           "snapshot waits ahead fill the room (snapshotWaiting)", ready=not waits)
@@ -20620,6 +20658,9 @@ class LandQueue:
                 if got.returncode == 0:
                     if whys:
                         log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
+                    # every delivered notice, so a flood is counted from this log, not only from its receiver's
+                    log({"event": "land-notified", "key": e["key"], "to": to, "class": cls or LAND_NOTICE_CLASS,
+                         "severity": severity, "message": land_trim(message, 160)})
                     return
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
                 if LAND_NOTIFY_GONE.search(whys[-1]):

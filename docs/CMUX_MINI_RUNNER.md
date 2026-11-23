@@ -1814,8 +1814,8 @@ in at the producer's root. So one root job per root per mini:
   `--test-keychain`. It runs only cmux's thin `cmux-ci` client jobs, which submit to the cmux-ci controller and
   wait with about no CPU on the mini (the hook's `GATEWAY_JOBS`, by workflow file and job id: `cmux-next.yml`'s
   `app-compile-fleet`, `swift-canary-fleet`, `release-compile-fast`, `fast-tier-fleet`, `swift-test-fleet` and
-  `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile` and
-  `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
+  `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile`,
+  `cmux-next-tip-test-compile.yml`'s `compile` and `cmux-next-head-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
   steps run on the bench mini or a measure worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
   display worker and leaves its PNG archive in fleet storage, and `cmux-next-ios-try-ahead.yml`'s `build-ahead`, which

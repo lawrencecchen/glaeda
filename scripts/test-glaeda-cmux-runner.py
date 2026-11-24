@@ -673,7 +673,8 @@ class HookTest(unittest.TestCase):
                 "job": "integrations-production", "run_attempt": "1"}
         self.assertIsNone(hook.trusted_refusal(**args))
         self.assertIsNone(hook.trusted_refusal(**{**args, "run_attempt": "2"}), "a re-run of main's dispatch")
-        for name in ("fleet-reconciler-now.yml", "synthetic-probes-environments-production.yml", "next-dogfood.yml"):
+        for name in ("fleet-reconciler-now.yml", "synthetic-probes-environments-production.yml", "next-dogfood.yml",
+                     "screen-share-zero-touch-probe.yml", "new-tab-startup-probe.yml"):
             self.assertIsNone(hook.trusted_refusal(**{**args, "workflow_ref": wf.replace("synthetic-probes.yml", name)}))
         self.assertIsNone(hook.trusted_refusal(**{**args, "trusted_repo": "Manaflow-AI/cmuxterm-hq"}))
         for event_name, event_payload in (("push", {"ref": main, "repository": hq}), ("schedule", {"repository": hq})):
@@ -4428,7 +4429,8 @@ class HookTest(unittest.TestCase):
         side runner refuses it before taking anything, and FAST_TIER_BUSY does not admit it busy."""
         self.fleet()
         roots, stack = self.held_seed_roots()
-        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots))}
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots)),
+               hook.SIDE_SEED_WAIT_ENV: "0"}
         with stack:
             try:
                 side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
@@ -4443,6 +4445,59 @@ class HookTest(unittest.TestCase):
             self.assertNotIn("seed root:", side.stdout)
         finally:
             self.finish("s2")
+
+    def test_a_fast_tier_with_every_seed_root_held_waits_for_one_to_free_then_runs(self) -> None:
+        """SIDE_SEED_WAIT: after #2665, 57-69% of PR fast tiers an hour were refused at setup (12-18Z 11-23), each
+        re-run waiting out the Mac queue again. The side runner waits for a seed root instead, and runs on it."""
+        self.fleet()
+        roots, stack = self.held_seed_roots()
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots)),
+               hook.SIDE_SEED_WAIT_ENV: "60"}
+        timer = threading.Timer(1.0, stack.close)
+        timer.start()
+        try:
+            side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertIn("SIDE_SEED_WAIT start", side.stdout)
+            self.assertIn("SIDE_SEED_WAIT end: free after", side.stdout)
+            self.assertNotIn("refused", side.stdout)
+        finally:
+            timer.cancel()
+            stack.close()
+            self.finish("s2")
+        self.assertEqual(list(self.dir.glob(hook.SIDE_SEED_WAITER + "*")), [], "the waiter marker is gone")
+
+    def test_a_seed_wait_past_its_bound_or_with_every_waiter_slot_taken_is_refused_as_before(self) -> None:
+        roots, stack = self.held_seed_roots()
+        with stack, contextlib.redirect_stdout(io.StringIO()) as out:
+            why, cause = hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=0.2,
+                                             poll=0.05)
+            self.assertEqual((why, cause), ("SIDE_SEED_FREE x", None))
+            self.assertIn("SIDE_SEED_WAIT end: refused", out.getvalue())
+            live = [subprocess.Popen(["sleep", "30"]) for _ in roots]
+            try:
+                for proc in live:
+                    (self.dir / f"{hook.SIDE_SEED_WAITER}{proc.pid}").touch()
+                (self.dir / f"{hook.SIDE_SEED_WAITER}999999999").touch()  # a dead hook's marker counts for nothing
+                self.assertEqual(hook.side_seed_waiters(self.dir), len(roots))
+                self.assertFalse((self.dir / f"{hook.SIDE_SEED_WAITER}999999999").exists())
+                start = time.monotonic()
+                why, _ = hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=30)
+                self.assertEqual(why, "SIDE_SEED_FREE x", "one waiter per seed root: the next is refused at once")
+                self.assertLess(time.monotonic() - start, 5)
+            finally:
+                for proc in live:
+                    proc.kill()
+                    proc.wait()
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots),
+                                                 bound=0), ("SIDE_SEED_FREE x", None), "bound 0: as before")
+
+    def test_a_seed_wait_gives_up_when_its_job_is_gone(self) -> None:
+        roots, stack = self.held_seed_roots()
+        with stack, contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: "cancelled", tuple(roots),
+                                                 bound=30, poll=0.05), (None, "cancelled"))
+            self.assertIn("SIDE_SEED_WAIT end: abandoned", out.getvalue())
 
     def test_a_seed_root_is_free_when_the_first_is_unheld_or_a_marked_second_is(self) -> None:
         roots, stack = self.held_seed_roots(second=False)
@@ -4698,7 +4753,9 @@ class HookTest(unittest.TestCase):
                               ("cmux-next.yml", "daemon-test-fleet"), ("cmux-next-perf-bench.yml", "bench"),
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                               ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
-                              ("fleet-rd-host-macos.yml", "check"), ("cmux-next-head-compile.yml", "compile")):
+                              ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
+                              ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                              ("cmux-next-head-compile.yml", "compile")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",
@@ -5401,6 +5458,37 @@ class HookTest(unittest.TestCase):
             self.assertEqual(os.readlink(link), os.fspath((hooks / "glaeda-canonical-root").resolve()))
         finally:
             self.finish("s0")
+
+    def test_dedicated_job_started_links_the_root_shim_too(self) -> None:
+        # cmux7s runs only dedicated runners; its trusted-main seed calls glaeda-canonical-root take, which was missing
+        fleet = self.fleet()
+        (fleet / "bin").mkdir()
+        hooks = self.dir / "hooks"
+        hooks.mkdir()
+        shutil.copy(HOOK, hooks / "glaeda-cmux-runner-hook")
+        (hooks / "glaeda-canonical-root").write_text("#!/bin/sh\n")
+        admit = hooks / "admit.sh"
+        admit.write_text("#!/bin/sh\nexit 0\n")
+        admit.chmod(0o755)
+        state = self.dir / "state"
+        state.mkdir(exist_ok=True)
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.dir, "push", {"repository": CMUX})),
+                   "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "seed", "RUNNER_NAME": "d0"}
+        stale = state / "host-lock-holder-d0.roots"  # a crashed job's record
+        stale.write_text("root-1\n")
+        run = subprocess.run([sys.executable, os.fspath(hooks / "glaeda-cmux-runner-hook"), "job-started",
+                              "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--dedicated-admit", os.fspath(admit),
+                              "--capacity-dir", os.fspath(self.dir / "capacity"), "--state-dir", os.fspath(state),
+                              "--watch-pid", str(os.getpid())], env=environ, capture_output=True, text=True, timeout=30)
+        try:
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            link = fleet / "bin" / "glaeda-canonical-root"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link), os.fspath((hooks / "glaeda-canonical-root").resolve()))
+            self.assertFalse(stale.exists())
+        finally:
+            self.finish("d0")
 
     def test_capacity_one_root_job_per_canonical_root(self) -> None:
         # a consumer's rm -rf of <root>/src must never meet a compile or another consumer in that root

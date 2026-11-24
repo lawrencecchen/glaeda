@@ -6075,6 +6075,7 @@ class Daemon:
         self.plain_at: dict[str, float] = {}  # kind, or "rest" -> last read of a watch nothing is blocked on
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
+        self.script_cut = False  # ScriptWake saw a new glaeda-gh: a tick starting now gets no budget (serve clears it)
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
         self.post_at = float("-inf")  # the last content write (post_tick)
         self.post_tried = float("-inf")  # the outbox's own clock when post_tick last ran (post_due)
@@ -7255,7 +7256,7 @@ class Daemon:
             try:
                 self.read_rate_limit()
             finally:
-                self.tick_deadline = deadline
+                self.tick_deadline = min(deadline, self.tick_deadline)  # a ScriptWake cut in the window stands
         seen = self.budget.get(pool)
         return dict(seen) if isinstance(seen, dict) else None
 
@@ -9234,7 +9235,7 @@ class Daemon:
     def tick(self, now: float | None = None) -> dict:
         self.now = time.time() if now is None else now
         self.clock_real = now is None
-        self.tick_deadline = time.monotonic() + TICK_BUDGET
+        self.tick_deadline = time.monotonic() + (0.0 if self.script_cut else TICK_BUDGET)  # (ScriptWake)
         self.feed_after_controller, self.tick_thread = False, threading.get_ident()
         with contextlib.suppress(Exception):  # never stops a tick
             self.free_slots()
@@ -23539,6 +23540,48 @@ def script_changed(path: Path, seen: dict) -> bool:
     return True
 
 
+SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake
+
+
+class ScriptWake:
+    """The thread that ends a tick when a new glaeda-gh lands. serve noticed a swapped script only after the tick it was
+    in (up to TICK_BUDGET) and its TICK sleep: a lane VM, 2026-11-24, merge a8f8c140 went live 15 s after it merged, 7 s
+    of them a tick finishing after fast-patch had swapped the bytes. This stats the script every SCRIPT_WAKE_EVERY and,
+    on new content, ends the tick (its requests stop at the next tick_deadline check, the rest go first next tick)
+    and wakes serve's sleep, so the re-exec decision (reexec_due) runs within a second. One wake per new content."""
+
+    def __init__(self, path: Path, sha: str, daemon: Any, every: float = SCRIPT_WAKE_EVERY):
+        self.path, self.daemon, self.every = path, daemon, every
+        self.seen = {"stat": script_stat(path), "sha": sha}  # its own copy: serve's is not shared across threads
+        self.event = threading.Event()
+        self.woken: tuple | None = None  # the stat it last woke serve for
+
+    def check(self) -> bool:
+        """One stat; True when it woke serve."""
+        if not script_changed(self.path, self.seen):
+            return False
+        key = self.seen.get("changedStat")
+        if key == self.woken:
+            return False
+        self.woken = key
+        self.daemon.script_cut = True  # a tick that starts before serve sees the change: no budget (Daemon.tick)
+        self.daemon.tick_deadline = time.monotonic()  # the tick running now: its next deadline check stops it
+        self.event.set()
+        log({"event": "script-wake"})
+        return True
+
+    def run(self) -> None:
+        while True:
+            time.sleep(self.every)
+            with contextlib.suppress(OSError):  # a swap's rename: the next stat sees the new file
+                self.check()
+
+    def sleep(self, seconds: float) -> None:
+        """serve's TICK sleep, cut short by a wake."""
+        if self.event.wait(seconds):
+            self.event.clear()
+
+
 # ---------------------------------------------------------------- main watch: a glaeda merge live in seconds
 # Leo, 2026-11-23: "hm. i feel like there should be ways for you guys to incrementally fast-patch controllers and etc
 # etc stuff that goes over network intra network etc". The release ring put a glaeda merge live in p50 1,034 s, p95
@@ -23734,6 +23777,8 @@ def serve(foreground_ok: bool = False) -> int:
     watchdog.start()
     with contextlib.suppress(Exception):  # noqa: BLE001  no watch: the ring still installs
         start_main_watch()
+    wake = ScriptWake(me, seen["sha"], daemon)
+    threading.Thread(target=wake.run, name="glaeda-gh-script-wake", daemon=True).start()
     last = None
     while True:
         try:
@@ -23751,7 +23796,7 @@ def serve(foreground_ok: bool = False) -> int:
                 log({"event": "error", "error": describe(report), "site": "tick_failed"})
         with contextlib.suppress(Exception):  # noqa: BLE001  a reap that fails is tried again next tick
             reap_children()
-        time.sleep(TICK)
+        wake.sleep(TICK)
         watchdog.beat()
         try:
             if daemon.valve_due is not None:
@@ -23759,6 +23804,8 @@ def serve(foreground_ok: bool = False) -> int:
                 daemon.restart_self()
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             changed = script_changed(me, seen)
+            if changed:
+                daemon.script_cut = False  # serve has seen it: the ticks a held or deferred re-exec runs are whole
             if not changed and daemon.reexec_waiting:
                 # the script is back to the bytes this daemon runs (a reverted install): nothing to re-exec for, so the
                 # drain ends and land steps start again (land_tick)

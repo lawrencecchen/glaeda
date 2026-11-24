@@ -34718,6 +34718,58 @@ class LandTest(Base):
         q.entries["pr:o/r#1"] = {"key": "pr:o/r#1", "state": "judging"}
         self.assertTrue(self.daemon.land_busy())
 
+    def test_an_update_is_not_held_by_a_judgment_it_hands_over(self):
+        # lane-9, 2026-11-24: a fast-patch waited 145 s for "5 land step(s) running", all judgments (judge_handed)
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        self.assertTrue(q.handover)
+        fut = mock.Mock()
+        fut.done.return_value = False
+        q.jobs["pr:o/r#1"] = fut
+        q.judging["pr:o/r#1"] = (time.monotonic(), 300.0)
+        self.assertFalse(self.daemon.land_busy())
+        q.jobs["pr:o/r#2"] = fut  # a step outside a judgment (a merge): still drained
+        self.assertTrue(self.daemon.land_busy())
+
+    def test_a_judgment_outlives_a_reexec_and_the_next_daemon_reads_its_answer(self):
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        argv = [sys.executable, "-c", "print('fresh')"]
+        got = q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ))
+        self.assertEqual((got.returncode, got.stdout.strip()), (0, "fresh"))
+        self.assertEqual(list((gg.land_dir() / gg.LAND_JUDGING_DIR).iterdir()), [])  # its files go with its answer
+        # the previous image's child, still running: same argv, so its answer is read, not judged again
+        meta = gg.land_dir() / gg.LAND_JUDGING_DIR / gg.file_name("pr:o/r#1")
+        stem = meta.parent / f"{meta.stem}.old"
+        old = subprocess.Popen(["/bin/sh", "-c", f'sleep 1; echo handed > "{stem}.out"; echo 3 > "{stem}.rc"'])
+        gg.write_json(meta, {"argv": argv, "run": "old", "pid": old.pid, "at": time.time(), "deadline": time.time() + 30})
+        try:
+            got = q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ))
+        finally:
+            old.wait(timeout=10)
+        self.assertEqual((got.returncode, got.stdout.strip()), (3, "handed"))
+        self.assertEqual(list(meta.parent.iterdir()), [])
+        # one whose child is gone with no answer (killed, a zombie until reaped), or with another argv, is judged afresh
+        dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        time.sleep(0.3)  # ended, not reaped: kill(pid, 0) still answers
+        gg.write_json(meta, {"argv": argv, "run": "dead", "pid": dead.pid, "at": time.time(), "deadline": time.time() + 30})
+        started = time.monotonic()
+        self.assertEqual(q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ)).stdout.strip(), "fresh")
+        self.assertLess(time.monotonic() - started, 10)
+        gg.write_json(meta, {"argv": argv + ["x"], "run": "other", "pid": os.getpid(), "at": time.time(),
+                             "deadline": time.time() + 30})
+        self.assertEqual(q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ)).stdout.strip(), "fresh")
+        self.assertEqual(list(meta.parent.iterdir()), [])
+
+    def test_a_handed_judgment_past_its_bound_times_out(self):
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        with self.assertRaises(subprocess.TimeoutExpired):
+            q.judge_handed("pr:o/r#1", [sys.executable, "-c", "import time; time.sleep(30)"], 1.0, dict(os.environ))
+
     def test_the_latch_holds_only_lands_with_no_unlatched_source(self):
         # huge-blue, 2026-11-18 15:24Z: the login's GraphQL latched, 382 open lands, workers busy=0, nothing judged,
         # though land_judge reads manaflow-ai through the lander App pools.

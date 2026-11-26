@@ -16215,6 +16215,18 @@ LAND_STOPPED_READ_EVERY = LAND_OWNER_REMIND_EVERY
 # nothing (history remind_held, once a stop) until a read lands, and then it ends (merged, closed) or is told. The
 # requester was told at the stop with its one step, so holding costs nobody a step. LAND_OWNER_REMIND_MAX stays the
 # one bound on how many in all. Detector: test-glaeda-gh.py test_a_reminder_on_an_unread_copy_is_never_told.
+# LAND_OWNER_REMIND_STALE: a reminder is an inbox fyi (LAND_OWNER_REMIND_ENDS), and an fyi wakes nobody, so a stop its
+# requester did not act on in the first day was never heard again: cmux-cp-1, 2026-11-26, ~45 rows "still stopped
+# after 29-65 h" (lw#8652 ... lw#10988, cmux#53146, hq#26188), each reminded as fyi to a coordinator that had queued
+# them for helpers long gone. Of 25 open leo-workspace ones, 17 were base-red fixes main had fixed another way (close),
+# 4 merged main cleanly (re-queue) and 4 needed a hand merge: all one decision away. The first reminder past
+# LAND_OWNER_REMIND_STALE_AFTER at a head unmoved since the stop goes as a blocker (it wakes), names that decision, and
+# is also a coordinator notice (land-stopped-stale); once per stop head (reminds.staleHead), every later reminder of
+# that stop is an fyi again. It is only ever a reminder LAND_OWNER_REMIND_UNREAD lets through, so only on a copy a read
+# refreshed since the row's last word: an unread copy (maybe a PR merged since) is held and wakes nobody. Detectors:
+# test-glaeda-gh.py test_a_stop_unmoved_past_a_day_wakes_its_owner_once,
+# test_a_stale_stop_on_an_unread_copy_is_held_and_wakes_nobody.
+LAND_OWNER_REMIND_STALE_AFTER = 86400.0
 
 # LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
 # reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
@@ -20567,9 +20579,14 @@ class LandQueue:
                 log({"event": "land-remind-held", "key": e["key"], "code": code, "why": "unread"})
             self.save(e)
             return False
+        # LAND_OWNER_REMIND_STALE: past a day at the stop's own head, read now (head), once per stop head, a blocker
+        stale = (bool(head) and not moved and bool(was) and self.now - at >= LAND_OWNER_REMIND_STALE_AFTER
+                 and str(r.get("staleHead") or "") != was)
+        stale_head = was if stale else str(r.get("staleHead") or "")
         e["remindLife"] = {**life, "unread": int(life.get("unread") or 0) + (0 if head else 1)}
         e["reminds"] = {"n": n + 1, "at": self.now, "code": code,
-                        **({"head": head} if head else {})}  # attributable to the stop it answered, at the head read
+                        **({"head": head} if head else {}),  # attributable to the stop it answered, at the head read
+                        **({"staleHead": stale_head} if stale_head else {})}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
                f"{land_reason(st.get('reason') or '', 300)}")
@@ -20580,6 +20597,9 @@ class LandQueue:
             # head: the re-queue at the head now comes first, and the stop's own sha is dated.
             msg += (f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old; the head now is {head[:12]}: "
                     f"`glaeda-gh land {e['repo']}#{e['number']} --pin {head}` judges it there")
+        if stale:
+            msg += (f"\nunmoved {hours:.0f} h at {was[:12]}: take the step above and re-queue at the new head, or close "
+                    f"the PR naming what superseded it, or hand it to a live owner; this wakes you once for this head")
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
         if n + 1 < LAND_OWNER_REMIND_MAX:
@@ -20588,12 +20608,17 @@ class LandQueue:
         else:
             msg += f"\n(reminder {n + 1} of {LAND_OWNER_REMIND_MAX}, the last; `glaeda-gh land status` still lists it)"
         self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1),
-                     **({"moved": head[:12]} if moved else {}))
+                     **({"moved": head[:12]} if moved else {}), **({"stale": True} if stale else {}))
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
-             "hours": round(hours, 1), "moved": moved})
+             "hours": round(hours, 1), "moved": moved, "stale": stale})
         self.save(e)
-        # told at the stop; a repeat is an inbox fyi, and none to a lane idle past the reaper's bound
-        self.notify(e, to, msg, cls=LAND_FORWARD_FYI_CLASS, unless_idle=LAND_OWNER_REMIND_IDLE)
+        if stale:
+            with contextlib.suppress(Exception):
+                self.notice("land-stopped-stale", "warn", f"{msg} (requester {to})", {"pr": self.url(e), "to": to})
+        # told at the stop; a repeat is an inbox fyi, except the one LAND_OWNER_REMIND_STALE wake, and none to a lane
+        # idle past the reaper's bound (the coordinator notice above still says a stale one)
+        self.notify(e, to, msg, cls=LAND_NOTICE_CLASS if stale else LAND_FORWARD_FYI_CLASS,
+                    unless_idle=LAND_OWNER_REMIND_IDLE)
         return True
 
     def stopped_over(self, e: dict) -> bool:

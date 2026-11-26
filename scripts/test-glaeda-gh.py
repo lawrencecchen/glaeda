@@ -30771,6 +30771,55 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 16)  # past LAND_OWNER_REMIND_MAX: silent, still listed
         self.assertEqual((e["state"], e["reminds"]["n"], len(self.w.sent())), ("stopped", 4, sent + 4))
 
+    def remind_until_stale(self):
+        """Tick the stopped row to each due reminder of LAND_OWNER_REMIND_BACKOFF (6 h, then 12 h, then 24 h after
+        the last), three in all, the third past LAND_OWNER_REMIND_STALE_AFTER; the entry after each."""
+        out = []
+        e = self.q.entries.get(self.KEY) or {}
+        for k in range(3):
+            last = float((e.get("reminds") or {}).get("at") or (e.get("stop") or {}).get("at"))
+            self.tick(last + gg.LAND_OWNER_REMIND_EVERY * 2 ** k - self.t)  # due: asks its read
+            e = self.tick()  # the read landed (or, with none, it waits)
+            if len(out) == k and (e.get("reminds") or {}).get("n", 0) == k:
+                e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)  # no read came: told, or held, on the copy there is
+            out.append(e)
+        return out
+
+    def test_a_stop_unmoved_past_a_day_wakes_its_owner_once(self):
+        # LAND_OWNER_REMIND_STALE: cmux-cp-1, 2026-11-26: ~45 rows sat stopped 29-65 h, reminded only as fyi.
+        self.conflict_stop()
+        self.fresh_head = LA  # each reminder's read lands: the PR is unchanged at the stop's head
+        classes = lambda: [c[c.index("--class") + 1] for c in self.w.sent()]  # noqa: E731
+        sent = len(self.w.sent())
+        e = self.remind_until_stale()[-1]
+        self.assertEqual(classes()[sent:], ["fyi", "fyi", gg.LAND_NOTICE_CLASS])  # the first day fyi; then one wake
+        said = self.w.sent()[-1][-1]
+        self.assertRegex(said, r"unmoved 4[2-3] h")
+        self.assertIn("close the PR naming what superseded it", said)
+        self.assertEqual((e["state"], e["reminds"]["staleHead"]), ("stopped", LA))
+        self.assertTrue([h for h in e["history"] if h.get("event") == "reminded" and h.get("stale")])
+        self.tick(gg.LAND_OWNER_REMIND_EVERY * 8)
+        e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual(classes()[-1], "fyi")  # once per stop head, never again for it
+        self.assertEqual(e["reminds"]["staleHead"], LA)
+
+    def test_a_stale_stop_on_an_unread_copy_is_held_and_wakes_nobody(self):
+        # LAND_OWNER_REMIND_UNREAD before LAND_OWNER_REMIND_STALE: a copy no read refreshed may be a PR merged since, so
+        # it is never told (remind_held), past a day too: no fyi and no blocker; the wake waits for a read at the head
+        self.conflict_stop()
+        self.fresh_head = None  # every read fails
+        classes = lambda: [c[c.index("--class") + 1] for c in self.w.sent()]  # noqa: E731
+        sent = len(self.w.sent())
+        e = self.remind_until_stale()[-1]
+        self.assertEqual(classes()[sent:], [])  # nothing told on the unread copy: every reminder held
+        self.assertNotIn(gg.LAND_NOTICE_CLASS, classes()[sent:])
+        self.assertIsNone(e["reminds"].get("staleHead"))
+        self.assertIn("unread", [h.get("why") for h in e["history"] if h.get("event") == "remind_held"])
+        for _ in range(2):  # and stays held, never a blocker, while no read refreshes the copy
+            self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)
+            e = self.tick(gg.LAND_OWNER_REMIND_READ_WAIT)
+        self.assertEqual((classes()[sent:], e["state"]), ([], "stopped"))
+
     def test_a_reminder_to_a_lane_idle_past_the_reaper_bound_wakes_nobody(self):
         # LAND_OWNER_REMIND_IDLE: 2026-11-26, 53 of 406 live Claude sessions were finished lanes woken by "still
         # stopped after N h" reminders, 38 of gcp-agent-lane-10's 40 idle 24 to 101 h before it (cmuxterm-hq#28514).

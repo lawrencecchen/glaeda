@@ -37951,12 +37951,32 @@ class LandTest(Base):
         self.land_pinned(LB)
         e = self.tick(1)  # pin_wait: the nudge goes out, and nothing answers it
         self.assertIn("pin_wait", [h.get("event") for h in e["history"]])
-        e = self.tick(gg.NUDGE_MIN + 1)  # the direct read is due, every worker busy
-        self.assertEqual((pool.keys(), e["state"]), ([], "queued"))
-        self.assertIn(self.KEY, self.q.next_up, "a pin wait's direct read waits for a worker like a judgment")
-        del self.q.jobs["pr:o/r#99"]  # the worker frees between two passes
-        self.q.refill(self.t + 1)
-        self.assertEqual(pool.keys(), [self.KEY])
+        with mock.patch.object(gg, "LAND_PIN_READ_SLOTS", 0):  # no read slot past the workers: as before
+            e = self.tick(gg.NUDGE_MIN + 1)  # the direct read is due, every worker busy
+            self.assertEqual((pool.keys(), e["state"]), ([], "queued"))
+            self.assertIn(self.KEY, self.q.next_up, "with no read slot, the direct read waits for a worker")
+            del self.q.jobs["pr:o/r#99"]  # the worker frees between two passes
+            self.q.refill(self.t + 1)
+            self.assertEqual(pool.keys(), [self.KEY])
+            self.assertIsNotNone((self.q.entries[self.KEY].get("pinWait") or {}).get("directAt"))
+
+    def test_a_pinned_lands_direct_read_does_not_wait_for_a_worker(self):
+        """cmux-cp-1, 2026-11-26 11:01-11:29Z: cmux#58041, pinned at 1db9c73ca9d0 after its own update_branch, sat 28 min
+        on a cached 4b0b90460518 with 10 of 8-12 workers busy on 170-300 s judgments: its one PR read took a worker of
+        the judgments' pool. It now runs past the worker count, in one of LAND_PIN_READ_SLOTS."""
+        self.nudge_reads = False
+        pool = self.pooled(1)
+        self.pr(LA)
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()  # every worker busy
+        self.land_pinned(LB)
+        e = self.tick(1)
+        self.assertIn("pin_wait", [h.get("event") for h in e["history"]])
+        self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(pool.keys(), [self.KEY], "the read starts with every worker busy")
         self.assertIsNotNone((self.q.entries[self.KEY].get("pinWait") or {}).get("directAt"))
 
     def test_a_pinned_land_whose_reads_all_fail_stops_naming_the_pin_and_the_error(self):
@@ -41683,6 +41703,21 @@ class LandForwardTest(Base):
         self.assertIn("big-exec's land queue holds no row of it", e["stop"]["reason"])
         [said] = [c for c in self.w.sent() if "forward_lost" in c[-1]]
         self.assertEqual(said[3], "cosmic/coord")
+
+    def test_a_lost_forward_whose_far_row_stopped_earlier_ends_with_that_stop(self):
+        """cmux#55252, 2026-11-26: the land host held the row stopped (own_red) from before the requester's last
+        hand-off; the requester said "the hand-off was lost". It now ends with the far stop's own code and words."""
+        self.forwarded_to_executor()
+        self.pr(LA)
+        with self.q.lock:
+            e = self.q.entries[self.KEY]
+            e["forwardMissing"] = {"n": gg.LAND_FORWARD_LOST_ASKS, "gen": int(e.get("gen") or 0), "at": self.t,
+                                   "far": "stopped", "stop": {"code": "own_red", "reason": "red at its head", "next": "fix it"}}
+            with mock.patch.object(self.q, "outcome_read", return_value=True):
+                self.assertTrue(self.q.forward_lost(e, "big-exec", {}, self.t - 5))
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_stopped"))
+        self.assertIn("own_red", e["stop"]["reason"])
 
     def test_a_lost_forward_that_github_shows_merged_ends_merged_not_lost(self):
         self.forwarded_to_executor()
